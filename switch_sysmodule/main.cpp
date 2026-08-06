@@ -584,7 +584,15 @@ void handle_client(int client_sock) {
 }
 
 bool g_capssc_ready = false;
-std::atomic<int> g_active_connections(0);
+
+// std::thread aborts the whole process in this environment (libnx + -fno-exceptions:
+// a failed thread creation hits a throw, which becomes std::terminate/abort with no
+// crash report). Use libnx's native threadCreate/threadStart instead, which is the
+// supported mechanism for threads in sysmodules.
+Thread g_mdnsThread;
+void mdns_responder_entry(void*) {
+    mdns_responder();
+}
 
 void log_boot_status(const char* service, Result rc) {
     FILE *fb = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
@@ -599,6 +607,11 @@ void log_boot_status(const char* service, Result rc) {
     }
 }
 
+void trace(const char* msg) {
+    FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
+    if (f) { fprintf(f, "[TRACE] %s\n", msg); fflush(f); fclose(f); }
+}
+
 int main(int, char **) {
     // Wait for the OS and network to fully initialize before opening sockets (15s)
     svcSleepThread(15000000000ULL);
@@ -607,7 +620,7 @@ int main(int, char **) {
     if (R_SUCCEEDED(rc)) {
         fsdevMountSdmc();
     }
-    
+
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/HomeAssistantSwitch", 0777);
 
@@ -619,38 +632,71 @@ int main(int, char **) {
     rc = nsInitialize(); log_boot_status("ns", rc);
     rc = appletInitialize(); log_boot_status("applet", rc);
     rc = hiddbgInitialize(); log_boot_status("hiddbg", rc);
-    
+
     rc = capsscInitialize(); log_boot_status("capssc", rc);
     if (R_SUCCEEDED(rc)) g_capssc_ready = true;
-    
-    std::thread(mdns_responder).detach();
-    
+
+    // The bsd socket service is initialized on the main thread before any other
+    // thread touches sockets, so nothing else can race ahead of it.
+    //
+    // socketGetDefaultInitConfig() sizes its TCP/UDP buffers for a full game
+    // (~2.2MB of transfer memory, via sb_efficiency=4). __libnx_initheap() above
+    // only reserves a 2MB heap for this whole sysmodule, and tmemCreate() backs
+    // that transfer memory with a plain heap allocation — so socketInitialize()
+    // always failed here with LibnxError_OutOfMemory (0x559), confirmed via the
+    // logged Result code. Use a config sized for this sysmodule's actual needs
+    // (one small HTTP request/response at a time, tiny mDNS packets) instead.
+    trace("before socketInitialize");
+    SocketInitConfig sock_cfg = {
+        .tcp_tx_buf_size = 0x1000,
+        .tcp_rx_buf_size = 0x1000,
+        .tcp_tx_buf_max_size = 0x4000,
+        .tcp_rx_buf_max_size = 0x4000,
+        .udp_tx_buf_size = 0x800,
+        .udp_rx_buf_size = 0x800,
+        .sb_efficiency = 1,
+        .num_bsd_sessions = 3,
+        .bsd_service_type = BsdServiceType_User,
+    };
+
+    rc = socketInitialize(&sock_cfg);
+    if (R_FAILED(rc)) {
+        FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
+        if (f) { fprintf(f, "[ERR] socketInitialize failed: 0x%08X\n", rc); fclose(f); }
+        LOG_E("Failed to initialize sockets");
+        return 1;
+    }
+    trace("after socketInitialize");
+
+    trace("before mdns thread spawn");
+    rc = threadCreate(&g_mdnsThread, mdns_responder_entry, nullptr, nullptr, 0x2000, 0x2C, -2);
+    log_boot_status("mdns_thread_create", rc);
+    if (R_SUCCEEDED(rc)) {
+        rc = threadStart(&g_mdnsThread);
+        log_boot_status("mdns_thread_start", rc);
+    }
+    trace("after mdns thread spawn");
+
     g_logger.init();
+    trace("after logger init");
     LOG_I("Home Assistant Sysmodule started (v" APP_VERSION ")");
-    
+    trace("after LOG_I");
+
     // Heartbeat log for physical Switch troubleshooting
     ConfigManager::getInstance().load();
+    trace("after config load 1");
 
     ConfigManager::getInstance().load();
+    trace("after config load 2");
     FILE *fb = fopen("sdmc:/config/HomeAssistantSwitch/ha_sys_boot.log", "a");
-    
+    trace("after fopen heartbeat");
+
     if (fb) {
         time_t t = time(NULL);
         fprintf(fb, "[%ld] Sysmodule Main Started (v%s)\n", t, APP_VERSION);
         fprintf(fb, "[%ld] Port: %d\n", t, ConfigManager::getInstance().getPort());
         fprintf(fb, "[%ld] API Token: %s\n", t, ConfigManager::getInstance().getApiToken()[0] ? "SET" : "MISSING");
         fclose(fb);
-    }
-
-    const SocketInitConfig* default_cfg = socketGetDefaultInitConfig();
-    SocketInitConfig sock_cfg = *default_cfg;
-    sock_cfg.bsd_service_type = BsdServiceType_System;
-
-    if (R_FAILED(socketInitialize(&sock_cfg))) {
-        FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
-        if (f) { fprintf(f, "[ERR] socketInitialize failed\n"); fclose(f); }
-        LOG_E("Failed to initialize sockets");
-        return 1;
     }
 
     int server_fd, client_sock;
@@ -692,17 +738,10 @@ int main(int, char **) {
     
     while (true) {
         if ((client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0) {
-            if (g_active_connections >= 5) {
-                const char* resp = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n{\"error\": \"Too many active connections\"}";
-                write(client_sock, resp, strlen(resp));
-                close(client_sock);
-                continue;
-            }
-            g_active_connections++;
-            std::thread([client_sock]() {
-                handle_client(client_sock);
-                g_active_connections--;
-            }).detach();
+            // A std::thread per connection hit the same abort as the mDNS thread above.
+            // handle_client() already has a 2s timeout (select()), so handling requests
+            // synchronously here is safe and avoids reintroducing that bug.
+            handle_client(client_sock);
         }
     }
 
