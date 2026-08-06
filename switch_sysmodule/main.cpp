@@ -19,6 +19,7 @@
 #include <switch/services/bpc.h>
 #include <switch/services/ns.h>
 #include <switch/services/applet.h>
+#include <switch/services/apm.h>
 #include <switch/services/pm.h>
 #include <switch/services/hiddbg.h>
 #include <fcntl.h>
@@ -244,8 +245,12 @@ void handle_client(int client_sock) {
             }
         }
 
-        AppletOperationMode op_mode = appletGetOperationMode();
-        bool is_docked = (op_mode != AppletOperationMode_Handheld);
+        // apm is a standalone, low-level service - unlike appletGetOperationMode() it
+        // doesn't need an applet-type client session with am/omm to answer this (see the
+        // note on the fix below, near appletInitialize in main()).
+        ApmPerformanceMode perf_mode = ApmPerformanceMode_Normal;
+        apmGetPerformanceMode(&perf_mode);
+        bool is_docked = (perf_mode == ApmPerformanceMode_Boost);
         bool is_sleeping = false;
 
         snprintf(response, sizeof(response),
@@ -406,7 +411,10 @@ void handle_client(int client_sock) {
                 } else if (action == "launch_app" && j.contains("title_id")) {
                     std::string tid_str = j.value("title_id", "");
                     u64 tid = strtoull(tid_str.c_str(), NULL, 16);
+                    // Lazy applet session: see the note near appletInitialize in main().
+                    appletInitialize();
                     rc = appletRequestLaunchApplication(tid, NULL);
+                    appletExit();
                 }
                 
                 std::string resp_body = "{\"status\": \"ok\", \"rc\": " + std::to_string(rc) + "}";
@@ -458,7 +466,10 @@ void handle_client(int client_sock) {
         LOG_I("System sleep requested");
         const char *resp = "HTTP/1.1 200 OK\r\n\r\n{\"status\": \"ok\"}";
         write(client_sock, resp, strlen(resp));
+        // Lazy applet session: see the note near appletInitialize in main().
+        appletInitialize();
         appletRequestToSleep();
+        appletExit();
     } else if (strstr(buffer, "POST /reload_config")) {
         ConfigManager::getInstance().load();
         LOG_I("Config reloaded");
@@ -634,7 +645,21 @@ int main(int, char **) {
     rc = nifmInitialize(NifmServiceType_User); log_boot_status("nifm", rc);
     rc = pdmqryInitialize(); log_boot_status("pdmqry", rc);
     rc = nsInitialize(); log_boot_status("ns", rc);
-    rc = appletInitialize(); log_boot_status("applet", rc);
+    // NOT appletInitialize() here: it opens a client session with am/omm (the Operation
+    // Mode Manager, a Horizon OS system process) that's meant for a real, actively
+    // participating application - not a background sysmodule with __nx_applet_type ==
+    // AppletType_None. On real hardware, holding that session open long-term crashed
+    // omm roughly every 10-15 minutes (Atmosphere crash report: omm, Result 0x2A5, User
+    // Break). Draining it via appletMainLoop() made it *worse* (crashes every ~3
+    // minutes instead), so the actual fix is to avoid the applet/am session entirely
+    // for anything long-lived. apm is a separate, low-level service that answers
+    // dock-state queries (see ApmPerformanceMode usage in the /info handler below)
+    // without any of this. appletInitialize()/appletExit() are still used, but only
+    // wrapped tightly around the two rare user-triggered actions that genuinely need
+    // them (POST /control launch_app, POST /sleep) - open right before the call, close
+    // right after, so the process holds that session for milliseconds, not its entire
+    // lifetime.
+    rc = apmInitialize(); log_boot_status("apm", rc);
     rc = hiddbgInitialize(); log_boot_status("hiddbg", rc);
 
     rc = capsscInitialize(); log_boot_status("capssc", rc);
@@ -737,38 +762,22 @@ int main(int, char **) {
         if (f) { fprintf(f, "[OK] Server listening on port %d\n", ConfigManager::getInstance().getPort()); fclose(f); }
     }
 
-    // appletGetOperationMode()/appletGetPerformanceMode() only return a cached value that
-    // appletMainLoop() updates by draining queued notifications from am/omm (see libnx's
-    // applet.h: "state which is updated by appletMainLoop() when notifications are
-    // received"). We never called it, so that notification queue was never drained -
-    // this is what was crashing the omm system process (Atmosphere crash reports showed
-    // omm aborting on an outgoing IPC response, roughly every 10-15 minutes of uptime,
-    // which stopped entirely once this sysmodule was disabled). Poll accept() with a
-    // timeout instead of blocking forever so appletMainLoop() still gets called
-    // regularly even with no HTTP traffic. 30s keeps the battery-optimization intent
-    // (thread mostly suspended) while giving a wide safety margin under that interval.
+    // Power Optimization: Leave server_fd in blocking mode.
+    // This allows the server thread to spend most of its time suspended, saving battery.
+    // (No applet/am session is held open here anymore - see the note near apmInitialize
+    // above - so there's no notification queue that needs periodic draining.)
     while (true) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(server_fd, &readfds);
-        struct timeval tv = {30, 0};
-
-        int sel = select(server_fd + 1, &readfds, NULL, NULL, &tv);
-        appletMainLoop();
-
-        if (sel > 0 && FD_ISSET(server_fd, &readfds)) {
-            if ((client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0) {
-                // A std::thread per connection hit the same abort as the mDNS thread above.
-                // handle_client() already has a 2s timeout (select()), so handling requests
-                // synchronously here is safe and avoids reintroducing that bug.
-                handle_client(client_sock);
-            }
+        if ((client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0) {
+            // A std::thread per connection hit the same abort as the mDNS thread above.
+            // handle_client() already has a 2s timeout (select()), so handling requests
+            // synchronously here is safe and avoids reintroducing that bug.
+            handle_client(client_sock);
         }
     }
 
     if (g_capssc_ready) capsscExit();
     hiddbgExit();
-    appletExit();
+    apmExit();
     nsExit();
     pdmqryExit();
     nifmExit();
