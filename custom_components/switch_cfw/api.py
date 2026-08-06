@@ -44,6 +44,10 @@ class SwitchAPI:
         """Shutdown the console."""
         return await self._post("/shutdown")
 
+    async def sleep(self) -> bool:
+        """Put the console to sleep."""
+        return await self._post("/sleep")
+
     async def trigger_update(self) -> bool:
         """Trigger a system update/Daybreak on the console."""
         return await self._post("/update")

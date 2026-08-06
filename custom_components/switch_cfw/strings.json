@@ -102,6 +102,9 @@
       },
       "shutdown": {
         "name": "Shutdown"
+      },
+      "sleep": {
+        "name": "Sleep"
       }
     },
     "update": {

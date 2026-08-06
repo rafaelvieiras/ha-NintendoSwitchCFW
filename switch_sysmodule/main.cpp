@@ -643,10 +643,22 @@ void handle_client(int client_sock) {
         LOG_I("System sleep requested");
         const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
         send_timeout(client_sock, resp, strlen(resp));
-        // Lazy applet session: see the note near appletInitialize in main().
-        appletInitialize();
-        appletRequestToSleep();
-        appletExit();
+        // appletRequestToSleep() was tried first, but it silently did nothing: it asks
+        // omm to sleep on behalf of the CALLING applet session, and this sysmodule has
+        // no foreground/application applet context (AppletType_None) for omm to act on.
+        // spsm (the same lower-level service already used for reboot/shutdown below) has
+        // its own "EnterSleep" command (id 1) that puts the whole system to sleep
+        // directly, the same way the physical power button does, without needing an
+        // active application session. libnx's spsm.h doesn't wrap this one, so it's
+        // dispatched by hand via the session spsmGetServiceSession() exposes.
+        spsmInitialize();
+        Result rc_sleep = serviceDispatch(spsmGetServiceSession(), 1);
+        spsmExit();
+        if (R_FAILED(rc_sleep)) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "spsm EnterSleep failed rc=%08X", rc_sleep);
+            LOG_E(msg);
+        }
     } else if (strstr(buffer, "POST /reload_config")) {
         ConfigManager::getInstance().load();
         LOG_I("Config reloaded");
@@ -828,6 +840,43 @@ void trace(const char* msg) {
     if (f) { fprintf(f, "[TRACE] %s\n", msg); fflush(f); fclose(f); }
 }
 
+// Builds a fresh listening socket bound to the configured port. Split out of main() so
+// the accept() loop can call it again to replace a socket that stopped working after a
+// real system sleep/wake cycle (see the note where this is called from the loop).
+static int create_listen_socket() {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        LOG_E("Failed to create socket");
+        return -1;
+    }
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(ConfigManager::getInstance().getPort());
+    address.sin_addr.s_addr = INADDR_ANY;
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
+        if (f) { fprintf(f, "[ERR] bind failed: %d\n", errno); fclose(f); }
+        LOG_E("Failed to bind socket");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 5) < 0) {
+        FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
+        if (f) { fprintf(f, "[ERR] listen failed\n"); fclose(f); }
+        LOG_E("Failed to listen on socket");
+        close(fd);
+        return -1;
+    }
+
+    FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
+    if (f) { fprintf(f, "[OK] Server listening on port %d\n", ConfigManager::getInstance().getPort()); fclose(f); }
+    return fd;
+}
+
 int main(int, char **) {
     // Wait for the OS and network to fully initialize before opening sockets (15s)
     svcSleepThread(15000000000ULL);
@@ -949,36 +998,11 @@ int main(int, char **) {
 
     int server_fd, client_sock;
     struct sockaddr_in address;
-    int opt = 1;
     int addrlen = sizeof(address);
 
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        LOG_E("Failed to create socket");
-        socketExit();
+    server_fd = create_listen_socket();
+    if (server_fd < 0) {
         return 1;
-    }
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_port = htons(ConfigManager::getInstance().getPort());
-    address.sin_addr.s_addr = INADDR_ANY;
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
-        if (f) { fprintf(f, "[ERR] bind failed: %d\n", errno); fclose(f); }
-        LOG_E("Failed to bind socket");
-        return 1;
-    }
-    if (listen(server_fd, 5) < 0) {
-        FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
-        if (f) { fprintf(f, "[ERR] listen failed\n"); fclose(f); }
-        LOG_E("Failed to listen on socket");
-        return 1;
-    }
-    
-    {
-        FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
-        if (f) { fprintf(f, "[OK] Server listening on port %d\n", ConfigManager::getInstance().getPort()); fclose(f); }
     }
 
     // Power Optimization: Leave server_fd in blocking mode.
@@ -990,10 +1014,12 @@ int main(int, char **) {
     // threading model, Connection: close, or num_bsd_sessions - none of which changed
     // the symptom at all. That points at the accept() loop itself getting stuck after
     // exactly one iteration. Logging every step to find out exactly where.
+    int consecutive_accept_failures = 0;
     while (true) {
         trace("accept: waiting");
         client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
         if (client_sock >= 0) {
+            consecutive_accept_failures = 0;
             char msg[64];
             snprintf(msg, sizeof(msg), "accept: got client_sock=%d", client_sock);
             trace(msg);
@@ -1008,12 +1034,44 @@ int main(int, char **) {
             char msg[64];
             snprintf(msg, sizeof(msg), "accept: failed errno=%d", errno);
             trace(msg);
+            // Seen on real hardware right after boot/Wi-Fi reassociation: accept() can
+            // return spurious network errors (e.g. EHOSTUNREACH) instead of blocking,
+            // which without a backoff turns this into a tight, non-blocking spin -
+            // pegging the CPU and flooding the trace log at hundreds of lines/sec until
+            // the network settles. Sleep briefly so a transient condition just waits it
+            // out instead of busy-looping.
+            svcSleepThread(200000000ULL); // 200ms
+            consecutive_accept_failures++;
+
+            // Also seen on real hardware after a real system sleep/wake cycle (unlike
+            // the transient post-boot Wi-Fi reassociation case above, this one does NOT
+            // recover on its own - confirmed by leaving it spinning on errno=113 for
+            // several minutes straight): the listening socket itself doesn't survive
+            // the network teardown/rebuild that happens around sleep, and every accept()
+            // on it fails forever afterwards. There's no clean way for a background
+            // sysmodule with no applet/am session to be notified of the sleep/wake
+            // transition directly (that's exactly the session we avoid holding - see the
+            // note near apmInitialize above), so instead: after ~5s of nothing but
+            // failures, assume the socket is dead and just replace it.
+            if (consecutive_accept_failures >= 25) {
+                trace("accept: too many consecutive failures, recreating listen socket");
+                close(server_fd);
+                server_fd = create_listen_socket();
+                if (server_fd < 0) {
+                    // Can't recover without a listening socket at all; give the network
+                    // more time to settle and try building a fresh one again.
+                    svcSleepThread(1000000000ULL); // 1s
+                    server_fd = create_listen_socket();
+                }
+                consecutive_accept_failures = 0;
+            }
         }
     }
 
     if (g_capssc_ready) capsscExit();
     hiddbgExit();
     apmExit();
+    ncmExit();
     nsExit();
     pdmqryExit();
     nifmExit();

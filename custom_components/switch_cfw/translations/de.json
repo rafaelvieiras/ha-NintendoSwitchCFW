@@ -102,6 +102,9 @@
       },
       "shutdown": {
         "name": "Ausschalten"
+      },
+      "sleep": {
+        "name": "Ruhezustand"
       }
     },
     "update": {

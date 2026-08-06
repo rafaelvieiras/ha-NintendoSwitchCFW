@@ -24,6 +24,7 @@ async def async_setup_entry(
         [
             RebootButton(coordinator),
             ShutdownButton(coordinator),
+            SleepButton(coordinator),
         ]
     )
 
@@ -48,3 +49,14 @@ class ShutdownButton(SwitchEntity, ButtonEntity):
     async def async_press(self) -> None:
         """Handle the button press."""
         await self.coordinator.api.shutdown()
+
+
+class SleepButton(SwitchEntity, ButtonEntity):
+    """Button to put the Nintendo Switch to sleep."""
+
+    _attr_translation_key = "sleep"
+    _attr_icon = "mdi:sleep"
+
+    async def async_press(self) -> None:
+        """Handle the button press."""
+        await self.coordinator.api.sleep()
