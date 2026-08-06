@@ -737,15 +737,32 @@ int main(int, char **) {
         if (f) { fprintf(f, "[OK] Server listening on port %d\n", ConfigManager::getInstance().getPort()); fclose(f); }
     }
 
-    // Power Optimization: Leave server_fd in blocking mode. 
-    // This allows the server thread to spend most of its time suspended, saving battery.
-    
+    // appletGetOperationMode()/appletGetPerformanceMode() only return a cached value that
+    // appletMainLoop() updates by draining queued notifications from am/omm (see libnx's
+    // applet.h: "state which is updated by appletMainLoop() when notifications are
+    // received"). We never called it, so that notification queue was never drained -
+    // this is what was crashing the omm system process (Atmosphere crash reports showed
+    // omm aborting on an outgoing IPC response, roughly every 10-15 minutes of uptime,
+    // which stopped entirely once this sysmodule was disabled). Poll accept() with a
+    // timeout instead of blocking forever so appletMainLoop() still gets called
+    // regularly even with no HTTP traffic. 30s keeps the battery-optimization intent
+    // (thread mostly suspended) while giving a wide safety margin under that interval.
     while (true) {
-        if ((client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0) {
-            // A std::thread per connection hit the same abort as the mDNS thread above.
-            // handle_client() already has a 2s timeout (select()), so handling requests
-            // synchronously here is safe and avoids reintroducing that bug.
-            handle_client(client_sock);
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(server_fd, &readfds);
+        struct timeval tv = {30, 0};
+
+        int sel = select(server_fd + 1, &readfds, NULL, NULL, &tv);
+        appletMainLoop();
+
+        if (sel > 0 && FD_ISSET(server_fd, &readfds)) {
+            if ((client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0) {
+                // A std::thread per connection hit the same abort as the mDNS thread above.
+                // handle_client() already has a 2s timeout (select()), so handling requests
+                // synchronously here is safe and avoids reintroducing that bug.
+                handle_client(client_sock);
+            }
         }
     }
 
