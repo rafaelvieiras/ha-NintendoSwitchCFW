@@ -643,48 +643,19 @@ void mdns_responder_entry(void*) {
     mdns_responder();
 }
 
-// The accept loop used to call handle_client() inline, so the whole server only ever
-// served one connection at a time - any client that connects without immediately
-// sending data (a stray probe, a health-checker, a browser prefetch) occupied the
-// server for up to handle_client()'s full 2s recv timeout, queuing every other client
-// behind it in the listen backlog. A small fixed pool of native worker threads (same
-// threadCreate/threadStart mechanism as mdns_responder above - std::thread still
-// aborts the process, see the note there) lets a few connections be served
-// concurrently, so one slow/idle client no longer blocks the rest.
-#define HTTP_WORKER_COUNT 3
-Thread g_httpWorkers[HTTP_WORKER_COUNT];
-bool g_httpWorkerActive[HTTP_WORKER_COUNT] = {false};
-int g_httpWorkerSlot = 0;
-
-void handle_client_entry(void* arg) {
-    int client_sock = (int)(intptr_t)arg;
-    handle_client(client_sock);
-}
-
-// Dispatches a client socket to the next worker slot, round-robin. If that slot's
-// previous connection hasn't finished yet, this blocks until it does (bounded by
-// handle_client()'s own 2s-per-call timeouts) - so at most one accept() waits at a
-// time instead of every queued client waiting behind every other one.
-void dispatch_client(int client_sock) {
-    int slot = g_httpWorkerSlot;
-    g_httpWorkerSlot = (g_httpWorkerSlot + 1) % HTTP_WORKER_COUNT;
-
-    if (g_httpWorkerActive[slot]) {
-        threadWaitForExit(&g_httpWorkers[slot]);
-        threadClose(&g_httpWorkers[slot]);
-        g_httpWorkerActive[slot] = false;
-    }
-
-    Result rc = threadCreate(&g_httpWorkers[slot], handle_client_entry, (void*)(intptr_t)client_sock, nullptr, 0x4000, 0x2C, -2);
-    if (R_SUCCEEDED(rc)) {
-        rc = threadStart(&g_httpWorkers[slot]);
-    }
-    if (R_SUCCEEDED(rc)) {
-        g_httpWorkerActive[slot] = true;
-    } else {
-        close(client_sock);
-    }
-}
+// REVERTED (see the note near the accept() loop in main()): a small pool of native
+// worker threads (threadCreate/threadStart, same mechanism as mdns_responder above)
+// was tried here to let a few connections be served concurrently. On real hardware it
+// made things categorically worse - the very first request after boot succeeded, but
+// every request after that reset instantly (curl "Recv failure: Connection reset by
+// peer", ~2-5ms, no crash report generated for our program ID, process stayed up).
+// Root cause not identified (no debugger available on-device); suspect either a
+// resource limit hit on the 2nd/3rd concurrent threadCreate() (silently falling into
+// the close(client_sock)-with-unread-request-data path below, which sends RST instead
+// of FIN) or a service/session that isn't safe to call from multiple native threads in
+// this constrained sysmodule environment. Don't retry this approach without proper
+// on-device debug tooling (this file's diagnostics are limited to log files + physical
+// reboots - see "Metodologia de diagnóstico" in the project doc).
 
 void log_boot_status(const char* service, Result rc) {
     FILE *fb = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
@@ -845,10 +816,12 @@ int main(int, char **) {
     // above - so there's no notification queue that needs periodic draining.)
     while (true) {
         if ((client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0) {
-            // See dispatch_client() above: hands off to a small worker thread pool
-            // instead of handling inline, so one slow client can't wedge every other
-            // connection behind it.
-            dispatch_client(client_sock);
+            // A std::thread per connection hit the same abort as the mDNS thread above,
+            // and a native-thread worker pool caused a worse regression on real
+            // hardware (see the note above handle_client()). handle_client() already
+            // has a 2s timeout (select()) on every recv()/write(), so handling requests
+            // synchronously here is the safest known-working option.
+            handle_client(client_sock);
         }
     }
 
