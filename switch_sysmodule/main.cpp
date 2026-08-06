@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <switch/services/spsm.h>
 #include <switch/services/ns.h>
+#include <switch/services/ncm.h>
 #include <switch/services/applet.h>
 #include <switch/services/apm.h>
 #include <switch/services/pm.h>
@@ -390,35 +391,79 @@ void handle_client(int client_sock) {
     }
 
     if (strstr(buffer, "GET /titles")) {
+        // NOTE: nsListApplicationRecord() (the ns "ApplicationRecord" database) was tried
+        // here first, but it consistently returned 0 entries on this hardware even though
+        // the home menu clearly shows installed games - it tracks eShop-style
+        // install/update bookkeeping, which sideloaded/dumped NSPs on a CFW SD card don't
+        // necessarily go through. The home menu itself, and title managers like
+        // Tinfoil/DBI, actually enumerate installed titles via the ncm content-meta
+        // database (which just reflects what NCA content physically exists in each
+        // storage), so that's what we use here instead - across both SD card and NAND
+        // user storage, since a title can live in either.
         std::string json_out = "[";
-        s32 total_records = 0;
-        nsListApplicationRecord(NULL, 0, 0, &total_records);
-        if (total_records > 0) {
-            NsApplicationRecord* records = (NsApplicationRecord*)malloc(sizeof(NsApplicationRecord) * total_records);
-            s32 actual_count = 0;
-            if (records && R_SUCCEEDED(nsListApplicationRecord(records, total_records, 0, &actual_count))) {
-                bool first = true;
-                for (s32 i = 0; i < actual_count; i++) {
-                    NsApplicationControlData* controlData = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
-                    if (controlData) {
-                        u64 actual_size = 0;
-                        if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, records[i].application_id, controlData, sizeof(NsApplicationControlData), &actual_size))) {
-                            char title_name[0x201] = {0};
-                            NacpLanguageEntry* langentry = NULL;
-                            if (R_SUCCEEDED(nacpGetLanguageEntry(&controlData->nacp, &langentry)) && langentry) {
-                                snprintf(title_name, sizeof(title_name), "%s", langentry->name);
+        bool first = true;
+        u64 seen_ids[128];
+        int seen_count = 0;
+
+        NcmStorageId storages_to_scan[2] = { NcmStorageId_SdCard, NcmStorageId_BuiltInUser };
+        for (int s = 0; s < 2; s++) {
+            NcmContentMetaDatabase db;
+            Result rc_open = ncmOpenContentMetaDatabase(&db, storages_to_scan[s]);
+            {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "titles: ncm open storage=%d rc=%08X", storages_to_scan[s], rc_open);
+                trace(msg);
+            }
+            if (R_FAILED(rc_open)) continue;
+
+            s32 total = 0, written = 0;
+            Result rc_count = ncmContentMetaDatabaseListApplication(&db, &total, &written, NULL, 0, NcmContentMetaType_Application);
+            {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "titles: ncm list count storage=%d rc=%08X total=%d", storages_to_scan[s], rc_count, (int)total);
+                trace(msg);
+            }
+            if (R_SUCCEEDED(rc_count) && total > 0) {
+                NcmApplicationContentMetaKey* keys = (NcmApplicationContentMetaKey*)malloc(sizeof(NcmApplicationContentMetaKey) * total);
+                if (keys) {
+                    Result rc_list = ncmContentMetaDatabaseListApplication(&db, &total, &written, keys, total, NcmContentMetaType_Application);
+                    if (R_SUCCEEDED(rc_list)) {
+                        for (s32 i = 0; i < written; i++) {
+                            u64 app_id = keys[i].application_id;
+
+                            bool dup = false;
+                            for (int j = 0; j < seen_count; j++) {
+                                if (seen_ids[j] == app_id) { dup = true; break; }
                             }
-                            if (!first) json_out += ",";
-                            char entry[1024];
-                            snprintf(entry, sizeof(entry), "{\"title_id\": \"0x%016lX\", \"name\": \"%s\"}", (unsigned long)records[i].application_id, title_name);
-                            json_out += entry;
-                            first = false;
+                            if (dup) continue;
+                            if (seen_count < (int)(sizeof(seen_ids) / sizeof(seen_ids[0]))) {
+                                seen_ids[seen_count++] = app_id;
+                            }
+
+                            NsApplicationControlData* controlData = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
+                            if (controlData) {
+                                u64 actual_size = 0;
+                                Result rc_ctrl = nsGetApplicationControlData(NsApplicationControlSource_Storage, app_id, controlData, sizeof(NsApplicationControlData), &actual_size);
+                                if (R_SUCCEEDED(rc_ctrl)) {
+                                    char title_name[0x201] = {0};
+                                    NacpLanguageEntry* langentry = NULL;
+                                    if (R_SUCCEEDED(nacpGetLanguageEntry(&controlData->nacp, &langentry)) && langentry) {
+                                        snprintf(title_name, sizeof(title_name), "%s", langentry->name);
+                                    }
+                                    if (!first) json_out += ",";
+                                    char entry[1024];
+                                    snprintf(entry, sizeof(entry), "{\"title_id\": \"0x%016lX\", \"name\": \"%s\"}", (unsigned long)app_id, title_name);
+                                    json_out += entry;
+                                    first = false;
+                                }
+                                free(controlData);
+                            }
                         }
-                        free(controlData);
                     }
+                    free(keys);
                 }
             }
-            if (records) free(records);
+            ncmContentMetaDatabaseClose(&db);
         }
         json_out += "]";
         char resp_head[256];
@@ -807,6 +852,7 @@ int main(int, char **) {
     rc = nifmInitialize(NifmServiceType_User); log_boot_status("nifm", rc);
     rc = pdmqryInitialize(); log_boot_status("pdmqry", rc);
     rc = nsInitialize(); log_boot_status("ns", rc);
+    rc = ncmInitialize(); log_boot_status("ncm", rc);
     // NOT appletInitialize() here: it opens a client session with am/omm (the Operation
     // Mode Manager, a Horizon OS system process) that's meant for a real, actively
     // participating application - not a background sysmodule with __nx_applet_type ==
