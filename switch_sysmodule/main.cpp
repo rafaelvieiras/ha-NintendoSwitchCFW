@@ -16,7 +16,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <stdlib.h>
-#include <switch/services/bpc.h>
+#include <switch/services/spsm.h>
 #include <switch/services/ns.h>
 #include <switch/services/applet.h>
 #include <switch/services/apm.h>
@@ -517,9 +517,14 @@ void handle_client(int client_sock) {
                 std::string action = j.value("action", "");
                 Result rc = 0;
                 if (action == "reboot") {
-                    bpcRebootSystem();
+                    // See the note near POST /reboot below for why this is spsm, not bpc.
+                    spsmInitialize();
+                    spsmShutdown(true);
+                    spsmExit();
                 } else if (action == "shutdown") {
-                    bpcShutdownSystem();
+                    spsmInitialize();
+                    spsmShutdown(false);
+                    spsmExit();
                 } else if (action == "launch_app" && j.contains("title_id")) {
                     std::string tid_str = j.value("title_id", "");
                     u64 tid = strtoull(tid_str.c_str(), NULL, 16);
@@ -568,12 +573,27 @@ void handle_client(int client_sock) {
         LOG_I("System reboot requested");
         const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
         send_timeout(client_sock, resp, strlen(resp));
-        bpcInitialize(); bpcRebootSystem(); bpcExit();
+        // bpcRebootSystem()/bpcShutdownSystem() (bpc = Board Power Controller) trigger
+        // an immediate, low-level hardware reboot/power-off with no orchestrated
+        // shutdown of running processes first. A reboot triggered this way from the HA
+        // "Reboot" button produced a fresh omm crash report (same 0x2A5 User Break
+        // signature as the original applet/am bug) and a visible boot-menu-appears-
+        // twice/black-screen glitch on real hardware - omm (or another system process)
+        // getting cut off mid-operation by the abrupt reboot signal, not anything
+        // specific to our applet/apm usage this time. spsm (Sleep/Power State Manager)
+        // is the higher-level service that Horizon's own System Settings "Restart" uses
+        // - spsmShutdown() orchestrates a graceful shutdown of running processes before
+        // the actual power event, avoiding that race.
+        spsmInitialize();
+        spsmShutdown(true);
+        spsmExit();
     } else if (strstr(buffer, "POST /shutdown")) {
         LOG_I("System shutdown requested");
         const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
         send_timeout(client_sock, resp, strlen(resp));
-        bpcInitialize(); bpcShutdownSystem(); bpcExit();
+        spsmInitialize();
+        spsmShutdown(false);
+        spsmExit();
     } else if (strstr(buffer, "POST /sleep")) {
         LOG_I("System sleep requested");
         const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
@@ -610,7 +630,10 @@ void handle_client(int client_sock) {
     } else if (strstr(buffer, "POST /update_app")) {
         const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\", \"message\": \"App update triggered\"}";
         send_timeout(client_sock, resp, strlen(resp));
-        bpcInitialize(); bpcRebootSystem(); bpcExit();
+        // See the note near POST /reboot above for why this is spsm, not bpc.
+        spsmInitialize();
+        spsmShutdown(true);
+        spsmExit();
     } else if (strstr(buffer, "POST /button")) {
         char* body = strstr(buffer, "\r\n\r\n");
         if (body) {
