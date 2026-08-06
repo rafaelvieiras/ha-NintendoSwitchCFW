@@ -142,17 +142,21 @@ void mdns_responder() {
 }
 
 void handle_client(int client_sock) {
+    // The server handles one connection at a time (see the accept loop in main() - a
+    // std::thread per connection isn't usable here). A select()-with-timeout on just the
+    // first recv() only bounds waiting for the client's request to *arrive* - every
+    // subsequent recv()/write() in this function (including the response writes below)
+    // was a plain blocking call with no timeout. A client that connects and then never
+    // reads its response (observed with a stalled `docker exec curl`) blocks write()
+    // forever, which - since there's only ever one connection being served - wedges the
+    // entire HTTP server for every other client until the console is rebooted.
+    // SO_RCVTIMEO/SO_SNDTIMEO bound every recv()/write() on this socket, not just the
+    // first one, closing that gap.
     struct timeval tv;
     tv.tv_sec = 2; // 2s timeout
     tv.tv_usec = 0;
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(client_sock, &readfds);
-
-    if (select(client_sock + 1, &readfds, NULL, NULL, &tv) <= 0) {
-        close(client_sock);
-        return;
-    }
+    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     char buffer[2048] = {0};
     int bytes_read = recv(client_sock, buffer, sizeof(buffer) - 1, 0);
