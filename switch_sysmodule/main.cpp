@@ -732,7 +732,15 @@ int main(int, char **) {
         .udp_tx_buf_size = 0x800,
         .udp_rx_buf_size = 0x800,
         .sb_efficiency = 1,
-        .num_bsd_sessions = 3,
+        // 3 (listen socket + mDNS UDP socket + exactly 1 spare) left no headroom for a
+        // client socket's session to be reclaimed before the next accept(): every HTTP
+        // test after the first request in a sequence either hung until the client gave
+        // up or reset instantly, on both the synchronous and threaded server designs -
+        // pointing at resource exhaustion in the bsd service rather than anything about
+        // the accept loop itself. num_bsd_sessions only affects how many socket-like
+        // objects this process can have open via the bsd service, not buffer sizes, so
+        // this doesn't meaningfully affect the OOM-driven sizing above.
+        .num_bsd_sessions = 8,
         .bsd_service_type = BsdServiceType_User,
     };
 
