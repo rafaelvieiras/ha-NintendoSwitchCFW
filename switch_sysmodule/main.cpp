@@ -257,7 +257,11 @@ void handle_client(int client_sock) {
             "\"current_game\": \"%s\", \"docked\": %s, \"sleep_mode\": %s, \"error_count\": %u}",
             (unsigned int)((hos_version >> 16) & 0xFF), (unsigned int)((hos_version >> 8) & 0xFF), (unsigned int)(hos_version & 0xFF),
             (unsigned int)battery_percent, (charger_type != 0) ? "true" : "false",
-            (int)(cpu_temp / 1000), (int)(gpu_temp / 1000), (int)(skin_temp / 1000),
+            // tsGetTemperature() (used above) already returns whole-degree Celsius, not
+            // milliC — the milliC variant (tsGetTemperatureMilliC) is only valid up to
+            // firmware 13.2.1, unusable on current firmware. Dividing by 1000 here
+            // silently truncated every real reading (e.g. 42C) down to 0.
+            (int)cpu_temp, (int)gpu_temp, (int)skin_temp,
             (unsigned long)uptime_s, (unsigned int)rssi, (unsigned long)total_mem, (unsigned long)used_mem,
             (unsigned long)sd_total, (unsigned long)sd_free, (unsigned long)title_id,
             title_name, (is_docked) ? "true" : "false", (is_sleeping) ? "true" : "false",
