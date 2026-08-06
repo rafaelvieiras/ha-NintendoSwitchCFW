@@ -165,13 +165,26 @@ static ssize_t recv_timeout(int sock, void* buf, size_t len, int timeout_sec) {
     return recv(sock, buf, len, 0);
 }
 
+// write() can return fewer bytes than requested (routine with the 4KB tcp_tx_buf_size
+// set for this sysmodule - see the note near SocketInitConfig in main()). The previous
+// version returned after a single partial write, silently dropping the rest of the
+// response - the client would see a truncated body or, if it kept expecting more, hang
+// or reset. Loop until everything is sent, re-arming the select() timeout for each
+// chunk so a client that stops reading mid-response still can't block forever.
 static ssize_t send_timeout(int sock, const void* buf, size_t len, int timeout_sec = 2) {
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(sock, &fds);
-    struct timeval tv = {timeout_sec, 0};
-    if (select(sock + 1, NULL, &fds, NULL, &tv) <= 0) return -1;
-    return write(sock, buf, len);
+    const u8* p = (const u8*)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+        struct timeval tv = {timeout_sec, 0};
+        if (select(sock + 1, NULL, &fds, NULL, &tv) <= 0) return sent > 0 ? (ssize_t)sent : -1;
+        ssize_t n = write(sock, p + sent, len - sent);
+        if (n <= 0) return sent > 0 ? (ssize_t)sent : -1;
+        sent += (size_t)n;
+    }
+    return (ssize_t)sent;
 }
 
 void handle_client(int client_sock) {
@@ -197,7 +210,7 @@ void handle_client(int client_sock) {
             api_token = ConfigManager::getInstance().getApiToken();
             snprintf(token_header, sizeof(token_header), "X-API-Token: %s", api_token);
             if (!strstr(buffer, token_header)) {
-                const char *resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{\"error\": \"Unauthorized\"}";
+                const char *resp = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{\"error\": \"Unauthorized\"}";
                 send_timeout(client_sock, resp, strlen(resp));
                 close(client_sock);
                 return;
@@ -275,7 +288,7 @@ void handle_client(int client_sock) {
         bool is_sleeping = false;
 
         snprintf(response, sizeof(response),
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n"
             "{\"firmware_version\": \"%u.%u.%u\", \"app_version\": \"" APP_VERSION "\", \"battery_level\": %u, \"charging\": %s, "
             "\"cpu_temp\": %d, \"gpu_temp\": %d, \"skin_temp\": %d, "
             "\"uptime\": %lu, \"wifi_rssi\": %u, \"mem_total\": %lu, \"mem_used\": %lu, "
@@ -331,7 +344,7 @@ void handle_client(int client_sock) {
         }
         json_out += "]";
         char resp_head[256];
-        snprintf(resp_head, sizeof(resp_head), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n", json_out.length());
+        snprintf(resp_head, sizeof(resp_head), "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n", json_out.length());
         send_timeout(client_sock, resp_head, strlen(resp_head));
         send_timeout(client_sock, json_out.c_str(), json_out.length());
         close(client_sock);
@@ -341,7 +354,7 @@ void handle_client(int client_sock) {
     if (strstr(buffer, "GET /screenshot")) {
         extern bool g_capssc_ready;
         if (!g_capssc_ready) {
-            const char *resp = "HTTP/1.1 503 Service Unavailable\r\n\r\n{\"error\": \"Screenshots disabled (capssc failed)\"}";
+            const char *resp = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n{\"error\": \"Screenshots disabled (capssc failed)\"}";
             send_timeout(client_sock, resp, strlen(resp));
             close(client_sock);
             return;
@@ -405,12 +418,12 @@ void handle_client(int client_sock) {
                     free(row_buf);
                 }
             } else {
-                const char *resp = "HTTP/1.1 500 Internal Server Error\r\n\r\n{\"error\": \"Capture failed\"}";
+                const char *resp = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n{\"error\": \"Capture failed\"}";
                 send_timeout(client_sock, resp, strlen(resp));
             }
             free(screen_buf);
         } else {
-            const char *resp = "HTTP/1.1 500 Internal Server Error\r\n\r\n{\"error\": \"OOM\"}";
+            const char *resp = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n{\"error\": \"OOM\"}";
             send_timeout(client_sock, resp, strlen(resp));
         }
         close(client_sock);
@@ -440,11 +453,11 @@ void handle_client(int client_sock) {
                 
                 std::string resp_body = "{\"status\": \"ok\", \"rc\": " + std::to_string(rc) + "}";
                 char resp[256];
-                snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n", resp_body.length());
+                snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n", resp_body.length());
                 send_timeout(client_sock, resp, strlen(resp));
                 send_timeout(client_sock, resp_body.c_str(), resp_body.length());
             } else {
-                const char* resp = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\": \"Missing action\"}";
+                const char* resp = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\": \"Missing action\"}";
                 send_timeout(client_sock, resp, strlen(resp));
             }
         }
@@ -466,7 +479,7 @@ void handle_client(int client_sock) {
         }
         json_out += "]";
         char resp_head[256];
-        snprintf(resp_head, sizeof(resp_head), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n", json_out.length());
+        snprintf(resp_head, sizeof(resp_head), "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n", json_out.length());
         send_timeout(client_sock, resp_head, strlen(resp_head));
         send_timeout(client_sock, json_out.c_str(), json_out.length());
         close(client_sock);
@@ -475,17 +488,17 @@ void handle_client(int client_sock) {
 
     if (strstr(buffer, "POST /reboot")) {
         LOG_I("System reboot requested");
-        const char *resp = "HTTP/1.1 200 OK\r\n\r\n{\"status\": \"ok\"}";
+        const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
         send_timeout(client_sock, resp, strlen(resp));
         bpcInitialize(); bpcRebootSystem(); bpcExit();
     } else if (strstr(buffer, "POST /shutdown")) {
         LOG_I("System shutdown requested");
-        const char *resp = "HTTP/1.1 200 OK\r\n\r\n{\"status\": \"ok\"}";
+        const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
         send_timeout(client_sock, resp, strlen(resp));
         bpcInitialize(); bpcShutdownSystem(); bpcExit();
     } else if (strstr(buffer, "POST /sleep")) {
         LOG_I("System sleep requested");
-        const char *resp = "HTTP/1.1 200 OK\r\n\r\n{\"status\": \"ok\"}";
+        const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
         send_timeout(client_sock, resp, strlen(resp));
         // Lazy applet session: see the note near appletInitialize in main().
         appletInitialize();
@@ -494,13 +507,13 @@ void handle_client(int client_sock) {
     } else if (strstr(buffer, "POST /reload_config")) {
         ConfigManager::getInstance().load();
         LOG_I("Config reloaded");
-        const char *resp = "HTTP/1.1 200 OK\r\n\r\n{\"status\": \"ok\"}";
+        const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
         send_timeout(client_sock, resp, strlen(resp));
     } else if (strstr(buffer, "POST /launch")) {
         char* id_ptr = strstr(buffer, "title_id=0x");
         if (id_ptr) {
             u64 tid = strtoull(id_ptr + 9, NULL, 16);
-            const char *resp = "HTTP/1.1 200 OK\r\n\r\n{\"status\": \"ok\"}";
+            const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
             send_timeout(client_sock, resp, strlen(resp));
             char log_msg[128];
             snprintf(log_msg, sizeof(log_msg), "Launching title ID: 0x%016lX", (unsigned long)tid);
@@ -513,11 +526,11 @@ void handle_client(int client_sock) {
             }
             pmshellExit();
         } else {
-            const char *resp = "HTTP/1.1 400 Bad Request\r\n\r\n";
+            const char *resp = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
             send_timeout(client_sock, resp, strlen(resp));
         }
     } else if (strstr(buffer, "POST /update_app")) {
-        const char *resp = "HTTP/1.1 200 OK\r\n\r\n{\"status\": \"ok\", \"message\": \"App update triggered\"}";
+        const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\", \"message\": \"App update triggered\"}";
         send_timeout(client_sock, resp, strlen(resp));
         bpcInitialize(); bpcRebootSystem(); bpcExit();
     } else if (strstr(buffer, "POST /button")) {
@@ -559,7 +572,7 @@ void handle_client(int client_sock) {
                             svcSleepThread(50000000ULL); // 50ms pause
                         }
                     }
-                    const char *resp = "HTTP/1.1 200 OK\r\n\r\n{\"status\": \"ok\"}";
+                    const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
                     send_timeout(client_sock, resp, strlen(resp));
                     close(client_sock);
                     return;
@@ -602,18 +615,18 @@ void handle_client(int client_sock) {
                 state.state.buttons = 0;
                 hiddbgSetAutoPilotVirtualPadState(0, &state);
                 
-                const char *resp = "HTTP/1.1 200 OK\r\n\r\n{\"status\": \"ok\"}";
+                const char *resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\": \"ok\"}";
                 send_timeout(client_sock, resp, strlen(resp));
             } else {
-                const char *resp = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\": \"Invalid button\"}";
+                const char *resp = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\": \"Invalid button\"}";
                 send_timeout(client_sock, resp, strlen(resp));
             }
         } else {
-            const char *resp = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\": \"Button name missing\"}";
+            const char *resp = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\": \"Button name missing\"}";
             send_timeout(client_sock, resp, strlen(resp));
         }
     } else {
-        const char *resp = "HTTP/1.1 404 Not Found\r\n\r\n";
+        const char *resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
         send_timeout(client_sock, resp, strlen(resp));
     }
     close(client_sock);
@@ -628,6 +641,49 @@ bool g_capssc_ready = false;
 Thread g_mdnsThread;
 void mdns_responder_entry(void*) {
     mdns_responder();
+}
+
+// The accept loop used to call handle_client() inline, so the whole server only ever
+// served one connection at a time - any client that connects without immediately
+// sending data (a stray probe, a health-checker, a browser prefetch) occupied the
+// server for up to handle_client()'s full 2s recv timeout, queuing every other client
+// behind it in the listen backlog. A small fixed pool of native worker threads (same
+// threadCreate/threadStart mechanism as mdns_responder above - std::thread still
+// aborts the process, see the note there) lets a few connections be served
+// concurrently, so one slow/idle client no longer blocks the rest.
+#define HTTP_WORKER_COUNT 3
+Thread g_httpWorkers[HTTP_WORKER_COUNT];
+bool g_httpWorkerActive[HTTP_WORKER_COUNT] = {false};
+int g_httpWorkerSlot = 0;
+
+void handle_client_entry(void* arg) {
+    int client_sock = (int)(intptr_t)arg;
+    handle_client(client_sock);
+}
+
+// Dispatches a client socket to the next worker slot, round-robin. If that slot's
+// previous connection hasn't finished yet, this blocks until it does (bounded by
+// handle_client()'s own 2s-per-call timeouts) - so at most one accept() waits at a
+// time instead of every queued client waiting behind every other one.
+void dispatch_client(int client_sock) {
+    int slot = g_httpWorkerSlot;
+    g_httpWorkerSlot = (g_httpWorkerSlot + 1) % HTTP_WORKER_COUNT;
+
+    if (g_httpWorkerActive[slot]) {
+        threadWaitForExit(&g_httpWorkers[slot]);
+        threadClose(&g_httpWorkers[slot]);
+        g_httpWorkerActive[slot] = false;
+    }
+
+    Result rc = threadCreate(&g_httpWorkers[slot], handle_client_entry, (void*)(intptr_t)client_sock, nullptr, 0x4000, 0x2C, -2);
+    if (R_SUCCEEDED(rc)) {
+        rc = threadStart(&g_httpWorkers[slot]);
+    }
+    if (R_SUCCEEDED(rc)) {
+        g_httpWorkerActive[slot] = true;
+    } else {
+        close(client_sock);
+    }
 }
 
 void log_boot_status(const char* service, Result rc) {
@@ -789,10 +845,10 @@ int main(int, char **) {
     // above - so there's no notification queue that needs periodic draining.)
     while (true) {
         if ((client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0) {
-            // A std::thread per connection hit the same abort as the mDNS thread above.
-            // handle_client() already has a 2s timeout (select()), so handling requests
-            // synchronously here is safe and avoids reintroducing that bug.
-            handle_client(client_sock);
+            // See dispatch_client() above: hands off to a small worker thread pool
+            // instead of handling inline, so one slow client can't wedge every other
+            // connection behind it.
+            dispatch_client(client_sock);
         }
     }
 
