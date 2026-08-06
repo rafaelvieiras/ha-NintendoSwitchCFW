@@ -251,8 +251,20 @@ void handle_client(int client_sock) {
     if (strstr(buffer, "GET /info")) {
         trace("info: start");
         char response[2048];
-        u32 hos_version = 0;
-        setsysGetFirmwareVersion((SetSysFirmwareVersion*)&hos_version);
+        // SetSysFirmwareVersion is a ~0x100 byte struct (major/minor/micro plus
+        // platform/version_hash/display_version/display_title strings) - the previous
+        // code cast a plain u32 to SetSysFirmwareVersion* and passed that to
+        // setsysGetFirmwareVersion(), which wrote the entire struct into 4 bytes of
+        // stack, corrupting ~250 bytes past it. It happened to not crash visibly since
+        // nothing on this stack frame is used before /info sends its response and
+        // returns, but corrupting adjacent stack memory on every single request is not
+        // something to leave in place. It also explains the wrong firmware_version
+        // ("0.5.22" instead of "22.5.0"): raw struct bytes major,minor,micro,padding1
+        // landed in the u32's 4 bytes, and the old (>>16)/(>>8)/(&0xFF) extraction -
+        // written for a real MAKEHOSVERSION-packed u32 - read them back in the wrong
+        // order.
+        SetSysFirmwareVersion fw_ver = {};
+        setsysGetFirmwareVersion(&fw_ver);
         trace("info: after setsys");
 
         u32 battery_percent = 0;
@@ -353,7 +365,7 @@ void handle_client(int client_sock) {
             "\"uptime\": %lu, \"wifi_rssi\": %u, \"mem_total\": %lu, \"mem_used\": %lu, "
             "\"sd_total\": %lu, \"sd_free\": %lu, \"current_title_id\": \"0x%016lX\", "
             "\"current_game\": \"%s\", \"docked\": %s, \"sleep_mode\": %s, \"error_count\": %u}",
-            (unsigned int)((hos_version >> 16) & 0xFF), (unsigned int)((hos_version >> 8) & 0xFF), (unsigned int)(hos_version & 0xFF),
+            (unsigned int)fw_ver.major, (unsigned int)fw_ver.minor, (unsigned int)fw_ver.micro,
             (unsigned int)battery_percent, (charger_type != 0) ? "true" : "false",
             // tsGetTemperature() (used above) already returns whole-degree Celsius, not
             // milliC — the milliC variant (tsGetTemperatureMilliC) is only valid up to
