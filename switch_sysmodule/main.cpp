@@ -141,6 +141,12 @@ void mdns_responder() {
     }
 }
 
+// trace() (defined near main(), below) is a debug-mode-gated logger: a no-op unless
+// ConfigManager's "debug" flag is set in settings.json (toggle it + POST
+// /reload_config to take effect without a reboot). Forward-declared here so the
+// request-path functions above main() in the file can call it too.
+void trace(const char* msg);
+
 // The server handles one connection at a time (see the accept loop in main() - a
 // std::thread per connection isn't usable here). A select()-with-timeout on just the
 // first recv() only bounded waiting for the client's request to *arrive* - every
@@ -156,6 +162,16 @@ void mdns_responder() {
 // libnx's headers define them. select() is what actually protected the original first
 // read, so use it explicitly around every recv()/write() instead of trusting
 // setsockopt() to do it implicitly.
+//
+// Found the actual root cause afterwards via trace()-instrumented builds: select()
+// correctly reports the socket as writable, but the write() call right after it can
+// still block indefinitely - not a select()/timeout bug at all, but tcp_tx_buf_size et
+// al. in SocketInitConfig (see main()) having been sized at the bare minimum needed to
+// fit this sysmodule's 2MB heap, with no headroom for the bsd service to reclaim a
+// closed connection's send buffer before the next one needed it. Fixed by growing
+// those buffers (there was plenty of unused heap to grow into). select()/timeout
+// guarding here is kept regardless, since write()/recv() can still legitimately block
+// on a slow or unresponsive client.
 static ssize_t recv_timeout(int sock, void* buf, size_t len, int timeout_sec) {
     fd_set fds;
     FD_ZERO(&fds);
@@ -172,6 +188,7 @@ static ssize_t recv_timeout(int sock, void* buf, size_t len, int timeout_sec) {
 // or reset. Loop until everything is sent, re-arming the select() timeout for each
 // chunk so a client that stops reading mid-response still can't block forever.
 static ssize_t send_timeout(int sock, const void* buf, size_t len, int timeout_sec = 2) {
+    trace("send_timeout: enter");
     const u8* p = (const u8*)buf;
     size_t sent = 0;
     while (sent < len) {
@@ -179,7 +196,13 @@ static ssize_t send_timeout(int sock, const void* buf, size_t len, int timeout_s
         FD_ZERO(&fds);
         FD_SET(sock, &fds);
         struct timeval tv = {timeout_sec, 0};
-        if (select(sock + 1, NULL, &fds, NULL, &tv) <= 0) return sent > 0 ? (ssize_t)sent : -1;
+        int sel = select(sock + 1, NULL, &fds, NULL, &tv);
+        {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "send_timeout: select returned %d", sel);
+            trace(msg);
+        }
+        if (sel <= 0) return sent > 0 ? (ssize_t)sent : -1;
         ssize_t n = write(sock, p + sent, len - sent);
         if (n <= 0) return sent > 0 ? (ssize_t)sent : -1;
         sent += (size_t)n;
@@ -188,10 +211,17 @@ static ssize_t send_timeout(int sock, const void* buf, size_t len, int timeout_s
 }
 
 void handle_client(int client_sock) {
+    trace("handle_client: entered");
     char buffer[2048] = {0};
     int bytes_read = recv_timeout(client_sock, buffer, sizeof(buffer) - 1, 2);
+    {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "handle_client: recv_timeout returned %d", bytes_read);
+        trace(msg);
+    }
     if (bytes_read <= 0) {
         close(client_sock);
+        trace("handle_client: early return (no data)");
         return;
     }
 
@@ -219,44 +249,58 @@ void handle_client(int client_sock) {
     }
 
     if (strstr(buffer, "GET /info")) {
+        trace("info: start");
         char response[2048];
         u32 hos_version = 0;
         setsysGetFirmwareVersion((SetSysFirmwareVersion*)&hos_version);
-        
+        trace("info: after setsys");
+
         u32 battery_percent = 0;
         psmGetBatteryChargePercentage(&battery_percent);
         u32 charger_type = 0;
         psmGetChargerType((PsmChargerType*)&charger_type);
+        trace("info: after psm");
 
         s32 cpu_temp = 0, gpu_temp = 0, skin_temp = 0;
         tsGetTemperature(TsLocation_Internal, &cpu_temp);
         gpu_temp = cpu_temp;
         skin_temp = cpu_temp;
+        trace("info: after ts");
 
         u64 uptime_s = svcGetSystemTick() / 19200000;
         u32 rssi = 0;
         nifmGetInternetConnectionStatus(NULL, &rssi, NULL);
+        trace("info: after nifm");
 
         u64 total_mem = 0, used_mem = 0;
         svcGetInfo(&total_mem, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
         svcGetInfo(&used_mem, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        trace("info: after svcGetInfo");
 
         u64 sd_total = 0;
         s64 sd_free = 0;
         FsDeviceOperator fs_op;
         if (R_SUCCEEDED(fsOpenDeviceOperator(&fs_op))) {
+            trace("info: fsOpenDeviceOperator ok");
             s64 temp_total = 0;
             if (R_SUCCEEDED(fsDeviceOperatorGetSdCardUserAreaSize(&fs_op, &temp_total))) {
                 sd_total = (u64)temp_total;
             }
             fsDeviceOperatorClose(&fs_op);
+        } else {
+            trace("info: fsOpenDeviceOperator FAILED");
         }
+        trace("info: after fs_op block");
 
         FsFileSystem sd_fs;
         if (R_SUCCEEDED(fsOpenSdCardFileSystem(&sd_fs))) {
+            trace("info: fsOpenSdCardFileSystem ok");
             fsFsGetFreeSpace(&sd_fs, "/", &sd_free);
             fsFsClose(&sd_fs);
+        } else {
+            trace("info: fsOpenSdCardFileSystem FAILED");
         }
+        trace("info: after sd_fs block");
 
         u64 title_id = 0;
         char title_name[512] = "None";
@@ -264,29 +308,44 @@ void handle_client(int client_sock) {
         s32 total_titles = 0;
         AccountUid uid = {0};
         if (R_SUCCEEDED(pdmqryQueryRecentlyPlayedApplication(uid, false, titles, 1, &total_titles)) && total_titles > 0) {
+            trace("info: pdmqry ok, has recent title");
             title_id = titles[0];
             NsApplicationControlData* controlData = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
             if (controlData) {
                 u64 actual_size = 0;
+                trace("info: before nsGetApplicationControlData");
                 if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, title_id, controlData, sizeof(NsApplicationControlData), &actual_size))) {
+                    trace("info: after nsGetApplicationControlData ok");
                     NacpLanguageEntry* langentry = NULL;
                     if (R_SUCCEEDED(nacpGetLanguageEntry(&controlData->nacp, &langentry))) {
                         strncpy(title_name, langentry->name, sizeof(title_name) - 1);
                         title_name[sizeof(title_name) - 1] = '\0';
                     }
+                } else {
+                    trace("info: nsGetApplicationControlData FAILED");
                 }
                 free(controlData);
             }
+        } else {
+            trace("info: pdmqry - no recent title or failed");
         }
+        trace("info: after title block");
 
         // apm is a standalone, low-level service - unlike appletGetOperationMode() it
         // doesn't need an applet-type client session with am/omm to answer this (see the
         // note on the fix below, near appletInitialize in main()).
         ApmPerformanceMode perf_mode = ApmPerformanceMode_Normal;
-        apmGetPerformanceMode(&perf_mode);
+        trace("info: before apmGetPerformanceMode");
+        Result apm_rc = apmGetPerformanceMode(&perf_mode);
+        {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "info: after apmGetPerformanceMode rc=%08X", apm_rc);
+            trace(msg);
+        }
         bool is_docked = (perf_mode == ApmPerformanceMode_Boost);
         bool is_sleeping = false;
 
+        trace("info: before snprintf");
         snprintf(response, sizeof(response),
             "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n"
             "{\"firmware_version\": \"%u.%u.%u\", \"app_version\": \"" APP_VERSION "\", \"battery_level\": %u, \"charging\": %s, "
@@ -306,8 +365,15 @@ void handle_client(int client_sock) {
             title_name, (is_docked) ? "true" : "false", (is_sleeping) ? "true" : "false",
             (unsigned int)Logger::getInstance().getErrorCount()
         );
-        send_timeout(client_sock, response, strlen(response));
+        trace("info: after snprintf, before send_timeout");
+        {
+            ssize_t sent = send_timeout(client_sock, response, strlen(response));
+            char msg[64];
+            snprintf(msg, sizeof(msg), "handle_client: /info send_timeout returned %ld", (long)sent);
+            trace(msg);
+        }
         close(client_sock);
+        trace("handle_client: /info done, closed");
         return;
     }
 
@@ -670,7 +736,14 @@ void log_boot_status(const char* service, Result rc) {
     }
 }
 
+// No-op unless ConfigManager's "debug" flag is set (settings.json, or POST
+// /reload_config after editing it live - no reboot needed). Verbose per-request
+// tracing like this is what pinned down the HTTP hang (see the note above
+// recv_timeout/send_timeout): kept permanently instead of ad-hoc instrumentation added
+// and stripped out on every investigation, but gated so it doesn't cost a fopen/fprintf
+// per request (and unbounded log growth) during normal operation.
 void trace(const char* msg) {
+    if (!ConfigManager::getInstance().getDebug()) return;
     FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_sysmodule_boot.log", "a");
     if (f) { fprintf(f, "[TRACE] %s\n", msg); fflush(f); fclose(f); }
 }
@@ -686,6 +759,12 @@ int main(int, char **) {
 
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/HomeAssistantSwitch", 0777);
+
+    // Loaded this early specifically so the "debug" flag (see trace() above) is known
+    // before any of the boot-sequence trace() calls below run. The two later
+    // ConfigManager::getInstance().load() calls further down are unrelated/pre-existing
+    // and left as-is (harmless to load more than once).
+    ConfigManager::getInstance().load();
 
     rc = setsysInitialize(); log_boot_status("setsys", rc);
     rc = psmInitialize(); log_boot_status("psm", rc);
@@ -723,24 +802,27 @@ int main(int, char **) {
     // always failed here with LibnxError_OutOfMemory (0x559), confirmed via the
     // logged Result code. Use a config sized for this sysmodule's actual needs
     // (one small HTTP request/response at a time, tiny mDNS packets) instead.
+    // Diagnostic instrumentation (trace() calls throughout handle_client()/send_timeout())
+    // pinned this down precisely: on the ~3rd HTTP request after boot, select() reports
+    // the socket writable ("select returned 1") but the write() call right after it
+    // blocks forever anyway. num_bsd_sessions (raised 3->8 in an earlier attempt) had
+    // zero effect on this - it only bounds how many socket-like objects can be open at
+    // once, not buffer/flow-control space. The real suspect is that tcp_tx_buf_size et
+    // al. below were sized at the bare minimum (4KB/16KB) purely to fit inside this
+    // sysmodule's 2MB heap after the original OOM fix (see the note above them) -
+    // nowhere near enough headroom for the bsd service to reclaim a closed connection's
+    // send buffer before the next one needs it. There's plenty of unused heap between
+    // that minimal sizing and the 2MB ceiling to grow into.
     trace("before socketInitialize");
     SocketInitConfig sock_cfg = {
-        .tcp_tx_buf_size = 0x1000,
-        .tcp_rx_buf_size = 0x1000,
-        .tcp_tx_buf_max_size = 0x4000,
-        .tcp_rx_buf_max_size = 0x4000,
+        .tcp_tx_buf_size = 0x2000,
+        .tcp_rx_buf_size = 0x2000,
+        .tcp_tx_buf_max_size = 0x8000,
+        .tcp_rx_buf_max_size = 0x8000,
         .udp_tx_buf_size = 0x800,
         .udp_rx_buf_size = 0x800,
         .sb_efficiency = 1,
-        // 3 (listen socket + mDNS UDP socket + exactly 1 spare) left no headroom for a
-        // client socket's session to be reclaimed before the next accept(): every HTTP
-        // test after the first request in a sequence either hung until the client gave
-        // up or reset instantly, on both the synchronous and threaded server designs -
-        // pointing at resource exhaustion in the bsd service rather than anything about
-        // the accept loop itself. num_bsd_sessions only affects how many socket-like
-        // objects this process can have open via the bsd service, not buffer sizes, so
-        // this doesn't meaningfully affect the OOM-driven sizing above.
-        .num_bsd_sessions = 8,
+        .num_bsd_sessions = 4,
         .bsd_service_type = BsdServiceType_User,
     };
 
@@ -822,14 +904,29 @@ int main(int, char **) {
     // This allows the server thread to spend most of its time suspended, saving battery.
     // (No applet/am session is held open here anymore - see the note near apmInitialize
     // above - so there's no notification queue that needs periodic draining.)
+    // TEMPORARY diagnostic instrumentation: every successful request after the very
+    // first one post-boot either hangs or resets instantly, regardless of the
+    // threading model, Connection: close, or num_bsd_sessions - none of which changed
+    // the symptom at all. That points at the accept() loop itself getting stuck after
+    // exactly one iteration. Logging every step to find out exactly where.
     while (true) {
-        if ((client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0) {
+        trace("accept: waiting");
+        client_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+        if (client_sock >= 0) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "accept: got client_sock=%d", client_sock);
+            trace(msg);
             // A std::thread per connection hit the same abort as the mDNS thread above,
             // and a native-thread worker pool caused a worse regression on real
             // hardware (see the note above handle_client()). handle_client() already
             // has a 2s timeout (select()) on every recv()/write(), so handling requests
             // synchronously here is the safest known-working option.
             handle_client(client_sock);
+            trace("handle_client: returned");
+        } else {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "accept: failed errno=%d", errno);
+            trace(msg);
         }
     }
 

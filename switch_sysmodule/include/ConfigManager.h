@@ -24,9 +24,12 @@ public:
     long getLastUpdateCheck();
     void setLastUpdateCheck(long timestamp);
 
+    bool getDebug();
+    void setDebug(bool debug);
+
     void generateDefaultConfig();
     void generatePassphrase(char* out, size_t max_len);
-    
+
     void setConfigPath(const char* path) { m_configPath = path; }
 
 private:
@@ -34,6 +37,7 @@ private:
     char m_apiToken[128];
     int m_port;
     long m_lastUpdateCheck;
+    bool m_debug;
     const char* m_configPath = "sdmc:/config/HomeAssistantSwitch/settings.json";
 
     void generateRandomToken(char* out, size_t length);

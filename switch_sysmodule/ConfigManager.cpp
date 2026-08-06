@@ -20,7 +20,7 @@ void ConfigManager::init() {
     getInstance().load();
 }
 
-ConfigManager::ConfigManager() : m_port(8275), m_lastUpdateCheck(0) {
+ConfigManager::ConfigManager() : m_port(8275), m_lastUpdateCheck(0), m_debug(false) {
     memset(m_apiToken, 0, sizeof(m_apiToken));
 }
 
@@ -57,6 +57,8 @@ bool ConfigManager::load() {
             if (start) {
                 m_lastUpdateCheck = atol(start + 1);
             }
+        } else if (strstr(line, "\"debug\"")) {
+            m_debug = strstr(line, "true") != NULL;
         }
     }
     fclose(f);
@@ -82,7 +84,7 @@ bool ConfigManager::save() {
     FILE* f = fopen(m_configPath, "w");
     if (!f) return false;
 
-    fprintf(f, "{\n  \"api_token\": \"%s\",\n  \"port\": %d,\n  \"last_update_check\": %ld\n}\n", m_apiToken, m_port, m_lastUpdateCheck);
+    fprintf(f, "{\n  \"api_token\": \"%s\",\n  \"port\": %d,\n  \"last_update_check\": %ld,\n  \"debug\": %s\n}\n", m_apiToken, m_port, m_lastUpdateCheck, m_debug ? "true" : "false");
     fclose(f);
     return true;
 }
@@ -98,6 +100,9 @@ void ConfigManager::setPort(int port) { m_port = port; }
 
 long ConfigManager::getLastUpdateCheck() { return m_lastUpdateCheck; }
 void ConfigManager::setLastUpdateCheck(long timestamp) { m_lastUpdateCheck = timestamp; }
+
+bool ConfigManager::getDebug() { return m_debug; }
+void ConfigManager::setDebug(bool debug) { m_debug = debug; }
 
 void ConfigManager::generateDefaultConfig() {
     generatePassphrase(m_apiToken, sizeof(m_apiToken));
