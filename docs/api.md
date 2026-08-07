@@ -34,6 +34,16 @@ Simulates controller inputs.
 - Macro sequence: `{"sequence": [{"button": "A", "hold_ms": 100}, {"button": "WAIT", "hold_ms": 200}, {"button": "B"}]}`
 - Joystick: `{"left_stick": {"x": 32767, "y": 0}}` (Range -32767 to 32767)
 
+### GET /titles
+Returns the list of installed titles (SD card + NAND user storage), resolved via the
+`ncm` content-meta database rather than the `ns` ApplicationRecord list (which doesn't
+reflect CFW-sideloaded titles).
+**Auth**: Required
+**Response**:
+```json
+[{"title_id": "0x0100000000010000", "name": "SUPER MARIO ODYSSEY"}]
+```
+
 ### POST /sleep
 Puts the console into sleep mode.
 **Auth**: Required
@@ -45,7 +55,29 @@ Executes advanced system-level actions.
 - Reboot: `{"action": "reboot"}`
 - Shutdown: `{"action": "shutdown"}`
 - Launch Title: `{"action": "launch_app", "title_id": "0100000000010000"}`
+  - Known limitation: titles with an installed update/patch currently fail to launch
+    (`fs` result `NcaBaseStorageOutOfRangeC`) - the storage-resolution this uses doesn't
+    account for patch layering the way `am`'s own launch path does. Titles with no
+    update installed launch fine.
 
 ### GET /logs
 Returns the latest sysmodule logs in JSON format.
 **Auth**: Required
+
+## Orchestrator control port (8276)
+
+Since `switch_sysmodule_orchestrator/`, the sysmodule ("core", this document's API) is
+launched and supervised by a separate, minimal orchestrator process instead of being
+launched directly by Atmosphere's boot2. The orchestrator exposes its own tiny port,
+independent of core's, so it keeps working even when a bad core deploy can't:
+
+### POST /self_restart
+Terminates and relaunches core. Same `X-API-Token` auth as the main API.
+```
+curl -X POST -H "X-API-Token: <token>" http://<switch-ip>:8276/self_restart
+```
+No physical console reboot is needed to pick up a redeployed core binary - upload the
+new `exefs.nsp` to `sdmc:/atmosphere/contents/010000000000CAFE/exefs.nsp` and call this.
+
+The orchestrator also runs its own health check against core's main port every 15s and
+restarts core automatically after 3 consecutive failures, independent of this endpoint.
