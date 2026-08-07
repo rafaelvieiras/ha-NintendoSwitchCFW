@@ -10,9 +10,11 @@ build/
 *.nacp
 switch_app/build/
 switch_sysmodule/build/
+switch_sysmodule_orchestrator/build/
 switch_build_out/
 # Renamed NSO used only as an intermediate for local PFS0/exefs.nsp packaging
 switch_sysmodule/main
+switch_sysmodule_orchestrator/main
 logo.png
 *.log
 *build*.txt
