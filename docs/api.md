@@ -98,3 +98,17 @@ new `exefs.nsp` to `sdmc:/atmosphere/contents/010000000000CAFE/exefs.nsp` and ca
 
 The orchestrator also runs its own health check against core's main port every 15s and
 restarts core automatically after 3 consecutive failures, independent of this endpoint.
+
+**Fix history:** earlier builds of the orchestrator terminated core and relaunched it
+after a fixed 500ms sleep, which was too short - `pm:shell` doesn't guarantee a
+terminated process is fully torn down (and its `program_id` slot released) the instant
+`TerminateProgram` returns, so the immediately-following `LaunchProgram` for the same
+`program_id` would silently no-op against the still-alive old process. Fixed by
+bounding the wait on `pm:shell`'s process-event queue (up to ~3s, polling
+`pmshellGetProcessEventInfo`/`pmshellCleanupProcess`) before relaunching. In practice,
+on this Atmosphere build the process-exit event never actually arrives on that queue
+for this kind of Atmosphere-content-override process (the wait always times out, and
+`CleanupProcess` returns a Libnx-side `IncompatSysVer`-class error) - so what actually
+fixes it is the wait itself taking ~3-4s instead of 500ms, not the theoretically-correct
+cleanup call succeeding. Validated on hardware: 3 consecutive `self_restart` calls with
+a distinct rebuilt binary each time, all picked up correctly, no reboot needed.

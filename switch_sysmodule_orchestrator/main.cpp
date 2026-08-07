@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <errno.h>
+#include <time.h>
 #include "../switch_sysmodule/include/ConfigManager.h"
 #include "../switch_sysmodule/include/SysmoduleConstants.h"
 
@@ -49,9 +50,14 @@ extern "C" {
             }
             setsysExit();
         }
+
+        // Best-effort only - log_line() falls back to an unadorned "[?]" prefix if this
+        // didn't succeed, same guard style core uses for its own time(NULL) logging.
+        timeInitialize();
     }
 
     void __appExit(void) {
+        timeExit();
         fsdevUnmountAll();
         fsExit();
         smExit();
@@ -78,28 +84,86 @@ u32 __nx_fs_num_sessions = 1;
 static void log_line(const char* msg) {
     FILE *f = fopen("sdmc:/config/HomeAssistantSwitch/ha_orchestrator_boot.log", "a");
     if (f) {
-        fprintf(f, "%s\n", msg);
+        time_t t = time(NULL);
+        fprintf(f, "[%ld] %s\n", (long)t, msg);
         fclose(f);
     }
 }
 
+// pm:shell session and process-event handle are kept open for the orchestrator's whole
+// lifetime (opened once in main(), never re-Initialize/Exit'd per call) - see the note
+// near terminate_core() below for why a fresh Initialize/Exit pair per restart was never
+// the actual problem; this just avoids unnecessary session churn while debugging it.
+static Event g_pm_process_event;
+static u64 g_core_pid = 0;
+
 static Result launch_core() {
-    pmshellInitialize();
     // storage=None: same Atmosphere-content-override case as any other custom system
     // module (see the note on this exact distinction in core's launch_program_by_id) -
     // core lives under /atmosphere/contents/, not the ncm/lr install database.
     NcmProgramLocation loc = {CORE_PROGRAM_ID, NcmStorageId_None, {0}};
-    Result rc = pmshellLaunchProgram(0, &loc, NULL);
-    pmshellExit();
+    u64 pid = 0;
+    Result rc = pmshellLaunchProgram(0, &loc, &pid);
+    if (R_SUCCEEDED(rc)) {
+        g_core_pid = pid;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "[LAUNCH] pid=%016lX", pid);
+        log_line(msg);
+    }
     return rc;
 }
 
+// Root cause of self_restart never actually swapping the running process (sistema.md
+// section 8.11/8.12): this used to fire TerminateProgram and just sleep 500ms before
+// calling LaunchProgram again for the same program_id. TerminateProgram only *requests*
+// termination - PM keeps the terminated process's slot (resource limit, handle, pid)
+// reserved until the caller observes its exit via the pm:shell process-event queue and
+// explicitly releases it with CleanupProcess(pid). Without that, a same-program_id
+// LaunchProgram shortly after can fail or silently no-op against the still-reserved old
+// process - consistent with what was observed on hardware: core's /info uptime never
+// reset and app_version never changed after self_restart, i.e. the old process was
+// never actually replaced. This is the same event+cleanup pattern nx-hbloader and
+// ns/qlaunch use for any process they launch and later tear down.
 static void terminate_core() {
-    pmshellInitialize();
-    // Ignore the result - this is expected to fail harmlessly if core already exited
-    // on its own (nothing to terminate).
-    pmshellTerminateProgram(CORE_PROGRAM_ID);
-    pmshellExit();
+    if (g_core_pid == 0) {
+        log_line("[TERM] no tracked pid, skipping");
+        return;
+    }
+    u64 target_pid = g_core_pid;
+
+    Result rc = pmshellTerminateProgram(CORE_PROGRAM_ID);
+    {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "[TERM] TerminateProgram rc=%08X pid=%016lX", rc, target_pid);
+        log_line(msg);
+    }
+
+    bool exited = false;
+    for (int i = 0; i < 15 && !exited; i++) { // ~3s total, 200ms per poll slice
+        Result wrc = eventWait(&g_pm_process_event, 200000000ULL);
+        if (R_FAILED(wrc)) continue; // nothing signaled in this slice, keep polling
+
+        PmProcessEventInfo info;
+        if (R_FAILED(pmshellGetProcessEventInfo(&info))) continue;
+
+        char msg[80];
+        snprintf(msg, sizeof(msg), "[TERM] pm event=%d pid=%016lX", info.event, info.process_id);
+        log_line(msg);
+
+        if (info.process_id == target_pid &&
+            (info.event == PmProcessEvent_Exit || info.event == PmProcessEvent_Crash)) {
+            exited = true;
+        }
+    }
+    if (!exited) log_line("[TERM] timed out waiting for exit event, cleaning up anyway");
+
+    Result crc = pmshellCleanupProcess(target_pid);
+    {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "[TERM] CleanupProcess rc=%08X", crc);
+        log_line(msg);
+    }
+    g_core_pid = 0;
 }
 
 static void restart_core(const char* reason) {
@@ -107,7 +171,6 @@ static void restart_core(const char* reason) {
     snprintf(msg, sizeof(msg), "[RESTART] %s", reason);
     log_line(msg);
     terminate_core();
-    svcSleepThread(500000000ULL); // let the port free up before relaunching
     Result rc = launch_core();
     snprintf(msg, sizeof(msg), "[RESTART] launch_core rc=%08X", rc);
     log_line(msg);
@@ -234,6 +297,24 @@ int main(int, char**) {
     };
     if (R_FAILED(socketInitialize(&sock_cfg))) {
         log_line("[ERR] socketInitialize failed");
+        return 1;
+    }
+
+    // Opened once for the whole process lifetime - see the comment above terminate_core()
+    // for why draining this via pmshellGetProcessEventInfo()+CleanupProcess() is required
+    // for a same-program_id relaunch to actually take effect.
+    Result pm_rc = pmshellInitialize();
+    if (R_FAILED(pm_rc)) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "[ERR] pmshellInitialize failed rc=%08X", pm_rc);
+        log_line(msg);
+        return 1;
+    }
+    pm_rc = pmshellGetProcessEventHandle(&g_pm_process_event);
+    if (R_FAILED(pm_rc)) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "[ERR] GetProcessEventHandle rc=%08X", pm_rc);
+        log_line(msg);
         return 1;
     }
 
