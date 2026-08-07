@@ -56,9 +56,26 @@ Executes advanced system-level actions.
 - Shutdown: `{"action": "shutdown"}`
 - Launch Title: `{"action": "launch_app", "title_id": "0100000000010000"}`
   - Known limitation: titles with an installed update/patch currently fail to launch
-    (`fs` result `NcaBaseStorageOutOfRangeC`) - the storage-resolution this uses doesn't
-    account for patch layering the way `am`'s own launch path does. Titles with no
-    update installed launch fine.
+    directly (`fs` result `NcaBaseStorageOutOfRangeC`) - the storage-resolution this uses
+    doesn't account for patch layering the way `am`'s own launch path does. Titles with
+    no update installed launch fine.
+  - **EXPERIMENTAL, currently broken**: for the patched-title case above, this
+    automatically falls back to a second mechanism (the "Album-override launcher") that
+    briefly takes over the Album applet to get a real Application context and launch
+    correctly. The takeover itself works (confirmed on hardware), but the *next* HTTP
+    request handled by core afterwards intermittently receives a corrupted request
+    body and fails to parse (`{"error": "Missing action"}` even for a trivial, correctly
+    received payload) - not yet root-caused. See the note in `SysmoduleConstants.h` near
+    `ALBUM_OVERRIDE_PROGRAM_ID` and the project doc for the investigation so far. Until
+    this is fixed, expect `POST /command`/`GET /launch_status` to occasionally need a
+    retry after triggering `launch_app` on a patched title.
+
+### GET /launch_status
+Reflects the state of the last Album-override launch fallback (see the `launch_app`
+note above) - `{"state": "idle"}` when none is pending, `{"state": "launching", ...}`
+while switch_app's launcher build is handling the handoff, `{"state": "launched", ...}`
+or `{"state": "error", ...}` once it reports a terminal result.
+**Auth**: Required
 
 ### GET /logs
 Returns the latest sysmodule logs in JSON format.

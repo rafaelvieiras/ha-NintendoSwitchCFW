@@ -79,6 +79,7 @@ extern "C" {
 
 #include "include/ConfigManager.h"
 #include "include/Logger.h"
+#include "include/SysmoduleConstants.h"
 
 Logger g_logger;
 
@@ -211,6 +212,153 @@ static ssize_t send_timeout(int sock, const void* buf, size_t len, int timeout_s
     return (ssize_t)sent;
 }
 
+// Where the pre-staged launcher binary (switch_app's `launcher` build target - see
+// switch_app/Makefile) lives permanently on the SD card, deployed there the same way as
+// every other release artifact (FTP), not fetched at request time. install/uninstall
+// below just copy/remove these two files into/out of Album's real content-override
+// slot, immediately around each launch that needs it (see ALBUM_OVERRIDE_PROGRAM_ID).
+#define LAUNCHER_ASSET_DIR "sdmc:/config/HomeAssistantSwitch/launcher"
+#define ALBUM_OVERRIDE_EXEFS_DIR "sdmc:/atmosphere/contents/" ALBUM_OVERRIDE_PROGRAM_ID "/exefs"
+
+static bool copy_file(const char* src, const char* dst) {
+    FILE* in = fopen(src, "rb");
+    if (!in) return false;
+    FILE* out = fopen(dst, "wb");
+    if (!out) { fclose(in); return false; }
+    char buf[4096];
+    size_t n;
+    bool ok = true;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
+    }
+    fclose(in);
+    fclose(out);
+    return ok;
+}
+
+static bool install_album_launcher_override() {
+    mkdir("sdmc:/atmosphere/contents/" ALBUM_OVERRIDE_PROGRAM_ID, 0777);
+    mkdir(ALBUM_OVERRIDE_EXEFS_DIR, 0777);
+    bool ok1 = copy_file(LAUNCHER_ASSET_DIR "/main", ALBUM_OVERRIDE_EXEFS_DIR "/main");
+    bool ok2 = copy_file(LAUNCHER_ASSET_DIR "/main.npdm", ALBUM_OVERRIDE_EXEFS_DIR "/main.npdm");
+    if (!(ok1 && ok2)) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "album_launcher: install failed (main=%d npdm=%d) - is %s staged?",
+                 ok1, ok2, LAUNCHER_ASSET_DIR);
+        LOG_E(msg);
+    }
+    return ok1 && ok2;
+}
+
+// Restores the real Album applet. Deliberately removes just the two files (not the
+// exefs/ or program-id directory) so a repeated install doesn't need to recreate them,
+// and so a leftover empty directory here is harmless if this ever runs without a prior
+// install (eg. on core's own boot, as a defensive cleanup - see main()).
+static void uninstall_album_launcher_override() {
+    remove(ALBUM_OVERRIDE_EXEFS_DIR "/main");
+    remove(ALBUM_OVERRIDE_EXEFS_DIR "/main.npdm");
+}
+
+// How long to wait for switch_app's launcher build to report launched/error via
+// launch_status.json after we hand it control (see run_launcher_mode() in
+// switch_app/main.cpp) before giving up and restoring the real Album regardless.
+#define ALBUM_LAUNCHER_TIMEOUT_SEC 20
+
+// Tracked in-process (single-threaded server, no locking needed) so a pending
+// Album-override launch can be finished opportunistically by whatever request happens
+// to come in next - see poll_album_launcher_completion() below for why this can't just
+// be a background thread waiting on it instead.
+static bool g_album_override_active = false;
+static u64 g_album_override_installed_tick = 0;
+
+// Restores the real Album as soon as switch_app's launcher build reports a terminal
+// state (or after ALBUM_LAUNCHER_TIMEOUT_SEC regardless, in case it never gets far
+// enough to write one at all - eg. a bad npdm). Deliberately NOT a blocking wait loop:
+// std::thread aborts the whole process here (see the note near mdns_responder_entry),
+// and a native threadCreate() worker pool made concurrent requests actively worse on
+// real hardware (see the note above handle_client()) - both already learned the hard
+// way earlier in this project. Cheap enough (one bool check when idle) to just call
+// unconditionally at the top of every request, piggybacking on however often the API is
+// already being polled (HA's own GET /info interval, in practice) instead of adding any
+// new blocking or background work.
+static void poll_album_launcher_completion() {
+    if (!g_album_override_active) return;
+
+    bool done = false;
+    FILE* sf = fopen(LAUNCH_STATUS_PATH, "r");
+    if (sf) {
+        char buf[256] = {0};
+        fread(buf, 1, sizeof(buf) - 1, sf);
+        fclose(sf);
+        json st = json::parse(buf, nullptr, false);
+        if (!st.is_discarded()) {
+            std::string state = st.value("state", "");
+            if (state == "launched" || state == "error") done = true;
+        }
+    }
+
+    u64 elapsed_ticks = svcGetSystemTick() - g_album_override_installed_tick;
+    if (!done && elapsed_ticks > (u64)ALBUM_LAUNCHER_TIMEOUT_SEC * armGetSystemTickFreq()) {
+        LOG_E("album_launcher: timed out waiting for launch_status.json, restoring Album anyway");
+        done = true;
+    }
+
+    if (done) {
+        uninstall_album_launcher_override();
+        g_album_override_active = false;
+    }
+}
+
+// Gets a real Application applet session to launch `tid` correctly (base+patch layering
+// included) by briefly taking over the Album applet with switch_app's launcher build -
+// see ALBUM_OVERRIDE_PROGRAM_ID's comment in SysmoduleConstants.h for the full
+// rationale. Only called as a fallback from launch_program_by_id() below, for the
+// specific failure (NcaBaseStorageOutOfRangeC) this exists to work around - not the
+// normal path for titles that already launch fine directly.
+//
+// Returns as soon as the launch is kicked off (rc reflects only that), not once the
+// game has actually finished loading - poll GET /launch_status for the real outcome.
+static Result request_launch_via_album(u64 tid) {
+    poll_album_launcher_completion(); // finish any earlier pending launch first
+
+    remove(LAUNCH_STATUS_PATH);
+
+    char req_body[64];
+    snprintf(req_body, sizeof(req_body), "{\"title_id\":\"%016llX\"}", (unsigned long long)tid);
+    FILE* rf = fopen(LAUNCH_REQUEST_PATH, "w");
+    if (!rf) {
+        LOG_E("album_launcher: failed to write launch_request.json");
+        return -1;
+    }
+    fwrite(req_body, 1, strlen(req_body), rf);
+    fclose(rf);
+
+    if (!install_album_launcher_override()) {
+        remove(LAUNCH_REQUEST_PATH);
+        return -1;
+    }
+
+    // Album is a real firmware system title (storage BuiltInSystem, unlike the
+    // NcmStorageId_None case used for our own custom sysmodules) - the override above
+    // swaps its code, not its launch storage.
+    NcmProgramLocation loc = {strtoull(ALBUM_OVERRIDE_PROGRAM_ID, NULL, 16), NcmStorageId_BuiltInSystem, {0}};
+    Result rc = pmshellLaunchProgram(0, &loc, NULL);
+    {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "album_launcher: pmshellLaunchProgram(Album) rc=%08X", rc);
+        LOG_I(msg);
+    }
+    if (R_FAILED(rc)) {
+        uninstall_album_launcher_override();
+        remove(LAUNCH_REQUEST_PATH);
+        return rc;
+    }
+
+    g_album_override_active = true;
+    g_album_override_installed_tick = svcGetSystemTick();
+    return 0;
+}
+
 // Launches a program by title ID via pmshell. NcmStorageId_None (used here previously,
 // in both callers below) makes pm try to resolve which storage the content lives on
 // itself - on this firmware it doesn't, and pmshellLaunchProgram() always failed
@@ -253,6 +401,13 @@ static Result launch_program_by_id(u64 tid) {
     }
 
     Result rc = 0;
+    // Tracks whether ANY attempt hit NcaBaseStorageOutOfRangeC specifically, not just
+    // the last one - with two storages tried in sequence, a real NcaBaseStorageOutOfRangeC
+    // on the SD attempt (the common case: title present, patch layering unresolved) gets
+    // masked by the NAND attempt failing right after with a different, less interesting
+    // error (ResultProgramNotFound, since the title usually isn't on NAND at all) if only
+    // the final loop-exit rc were checked.
+    bool hit_nca_error = false;
     for (int i = 0; i < 2; i++) {
         NcmProgramLocation loc = {tid, storages_to_try[i], {0}};
         rc = pmshellLaunchProgram(0, &loc, NULL);
@@ -263,12 +418,28 @@ static Result launch_program_by_id(u64 tid) {
             LOG_I(msg);
         }
         if (R_SUCCEEDED(rc)) return rc;
+        if (R_MODULE(rc) == 2 && R_DESCRIPTION(rc) == 1004) hit_nca_error = true;
+    }
+
+    // Known limitation (see docs/api.md): titles with an installed update/patch fail
+    // here with fs NcaBaseStorageOutOfRangeC (module=2 desc=1004) because this direct
+    // pmshell launch doesn't resolve base+patch NCA layering the way am's own launch
+    // path does. Fall back to the Album-override launcher (a real Application context)
+    // only for that specific failure - titles failing for other reasons (eg. truly not
+    // present on either storage) shouldn't pay the cost/risk of taking over Album.
+    // Note: on this path, success here only means the fallback launch was kicked off,
+    // not that the game has actually started - callers should poll GET /launch_status
+    // for the real outcome (see request_launch_via_album's own note on why).
+    if (hit_nca_error) {
+        LOG_I("launch_program_by_id: NcaBaseStorageOutOfRangeC, falling back to Album-override launcher");
+        rc = request_launch_via_album(tid);
     }
     return rc;
 }
 
 void handle_client(int client_sock) {
     trace("handle_client: entered");
+    poll_album_launcher_completion();
     char buffer[2048] = {0};
     int bytes_read = recv_timeout(client_sock, buffer, sizeof(buffer) - 1, 2);
     {
@@ -693,6 +864,30 @@ void handle_client(int client_sock) {
                 send_timeout(client_sock, resp, strlen(resp));
             }
         }
+        close(client_sock);
+        return;
+    }
+
+    if (strstr(buffer, "GET /launch_status")) {
+        // Reflects launch_status.json as-is - written by switch_app's launcher build
+        // during an Album-override fallback (see request_launch_via_album above), or
+        // absent/stale between launches. No in-memory state kept here: this is the only
+        // reader, and the file is small enough to just re-read on every request.
+        std::string json_out;
+        FILE* sf = fopen(LAUNCH_STATUS_PATH, "r");
+        if (sf) {
+            char buf[256] = {0};
+            fread(buf, 1, sizeof(buf) - 1, sf);
+            fclose(sf);
+            json st = json::parse(buf, nullptr, false);
+            json_out = st.is_discarded() ? "{\"state\": \"unknown\"}" : st.dump();
+        } else {
+            json_out = "{\"state\": \"idle\"}";
+        }
+        char resp_head[128];
+        snprintf(resp_head, sizeof(resp_head), "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n", json_out.length());
+        send_timeout(client_sock, resp_head, strlen(resp_head));
+        send_timeout(client_sock, json_out.c_str(), json_out.length());
         close(client_sock);
         return;
     }

@@ -18,6 +18,25 @@
 
 using json = nlohmann::json;
 
+#ifdef LAUNCHER_BUILD
+// Only the launcher build target (see switch_app/Makefile) needs this. The .nro build
+// runs under nx-hbloader, which hands it a large pre-sized heap by default - fine as-is,
+// proven working. The launcher build is a genuine standalone exefs.nsp process (no
+// hbloader involved), where an unmodified default __libnx_initheap gives a heap far too
+// small for this binary's curl/mbedtls/zlib linkage (unused at runtime in launcher mode,
+// but still statically linked in) - confirmed on real hardware via a crash report
+// (Atmosphère result 2345-0015, LibnxError_HeapAllocFailed) the very first time this ran
+// as the Album override. Same size as core's own heap (switch_sysmodule/main.cpp),
+// which links the identical library set successfully.
+extern "C" void __libnx_initheap(void) {
+    static char inner_heap[0x200000]; // 2MB
+    extern char* fake_heap_start;
+    extern char* fake_heap_end;
+    fake_heap_start = inner_heap;
+    fake_heap_end   = inner_heap + sizeof(inner_heap);
+}
+#endif
+
 #ifndef APP_VERSION
 #define APP_VERSION "0.2.4-dev"
 #endif
@@ -199,6 +218,59 @@ void make_dirs(std::string path) {
 bool file_exists(const char* path) {
     struct stat st;
     return (stat(path, &st) == 0);
+}
+
+static void write_launch_status(const std::string& state, u64 tid, const std::string& detail) {
+    json j;
+    j["state"] = state;
+    char tid_str[20];
+    snprintf(tid_str, sizeof(tid_str), "%016lX", tid);
+    j["title_id"] = tid_str;
+    j["detail"] = detail;
+    FILE* f = fopen(LAUNCH_STATUS_PATH, "w");
+    if (f) {
+        std::string s = j.dump();
+        fwrite(s.c_str(), 1, s.size(), f);
+        fclose(f);
+    }
+}
+
+// Runs only when core has taken this binary's place at ALBUM_OVERRIDE_PROGRAM_ID and
+// launched it specifically to perform a real application launch - see the constant's
+// comment in SysmoduleConstants.h for why (core's own pmshellLaunchProgram can't launch
+// patched titles correctly; this process gets a genuine Application applet session that
+// can). Deliberately skips consoleInit/socket/curl/nifm below - this build only ever
+// needs to live for the couple seconds it takes to hand off to the requested game, and
+// keeping it minimal keeps the exefs.nsp override's required capabilities minimal too.
+static int run_launcher_mode() {
+    FILE* rf = fopen(LAUNCH_REQUEST_PATH, "r");
+    if (!rf) return 1;
+    char buf[256] = {0};
+    fread(buf, 1, sizeof(buf) - 1, rf);
+    fclose(rf);
+    remove(LAUNCH_REQUEST_PATH);
+
+    json req = json::parse(buf, nullptr, false);
+    u64 tid = 0;
+    if (!req.is_discarded() && req.contains("title_id")) {
+        tid = strtoull(req.value("title_id", "0").c_str(), NULL, 16);
+    }
+
+    if (tid == 0) {
+        write_launch_status("error", 0, "invalid or missing title_id in request");
+        return 1;
+    }
+
+    write_launch_status("launching", tid, "");
+    Result rc = appletRequestLaunchApplication(tid, NULL);
+    if (R_SUCCEEDED(rc)) {
+        write_launch_status("launched", tid, "");
+    } else {
+        char detail[32];
+        snprintf(detail, sizeof(detail), "rc=%08X", rc);
+        write_launch_status("error", tid, detail);
+    }
+    return 0;
 }
 
 void check_and_fix_sysmodule(bool manual = false) {
@@ -489,6 +561,10 @@ void draw_ui(const std::string& latest_ver, bool checking_update, bool sysmodule
 }
 
 int main(int, char **) {
+    if (file_exists(LAUNCH_REQUEST_PATH)) {
+        return run_launcher_mode();
+    }
+
     consoleInit(NULL); consoleClear();
     g_is_applet_mode = (appletGetAppletType() == AppletType_LibraryApplet);
     
