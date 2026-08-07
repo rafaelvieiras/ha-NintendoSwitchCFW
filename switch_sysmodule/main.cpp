@@ -3,7 +3,6 @@
 #include <switch/services/psm.h>
 #include <switch/services/ts.h>
 #include <switch/services/nifm.h>
-#include <switch/services/pdm.h>
 #include <switch/services/fs.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +21,7 @@
 #include <switch/services/applet.h>
 #include <switch/services/apm.h>
 #include <switch/services/pm.h>
+#include <switch/services/lr.h>
 #include <switch/services/hiddbg.h>
 #include <fcntl.h>
 #include <thread>
@@ -211,6 +211,62 @@ static ssize_t send_timeout(int sock, const void* buf, size_t len, int timeout_s
     return (ssize_t)sent;
 }
 
+// Launches a program by title ID via pmshell. NcmStorageId_None (used here previously,
+// in both callers below) makes pm try to resolve which storage the content lives on
+// itself - on this firmware it doesn't, and pmshellLaunchProgram() always failed
+// (rc module=Loader desc=5), confirmed independent of the JSON-body fix in POST
+// /command above by reproducing the same failure through the pre-existing GET /launch
+// endpoint too. Same fix as the /titles ncm rework: name the actual storage instead of
+// leaving it to be inferred. Most sideloaded titles live on the SD card, so try that
+// first and fall back to NAND user storage (matches the two storages /titles scans).
+static Result launch_program_by_id(u64 tid) {
+    NcmStorageId storages_to_try[2] = { NcmStorageId_SdCard, NcmStorageId_BuiltInUser };
+
+    // Diagnostic: pmshellLaunchProgram() (via ldr) still failed with
+    // ProgramLocationEntryNotFound after naming the storage explicitly, which points at
+    // lr (Location Resolver) - a separate database from the ncm ContentMetaDatabase
+    // /titles reads - simply having no redirect entry for this program id. Query lr
+    // directly first so GET /logs shows exactly which storage(s), if any, already have
+    // one, instead of guessing further blind.
+    Result rc_lr_init = lrInitialize();
+    if (R_SUCCEEDED(rc_lr_init)) {
+        for (int i = 0; i < 2; i++) {
+            LrLocationResolver resolver;
+            Result rc_open = lrOpenLocationResolver(storages_to_try[i], &resolver);
+            char msg[192];
+            if (R_SUCCEEDED(rc_open)) {
+                char path_buf[FS_MAX_PATH] = {0};
+                Result rc_resolve = lrLrResolveProgramPath(&resolver, tid, path_buf);
+                snprintf(msg, sizeof(msg), "lr: storage=%d resolve rc=%08X path=%s",
+                         storages_to_try[i], rc_resolve, path_buf[0] ? path_buf : "(none)");
+                serviceClose(&resolver.s);
+            } else {
+                snprintf(msg, sizeof(msg), "lr: storage=%d open rc=%08X", storages_to_try[i], rc_open);
+            }
+            LOG_I(msg);
+        }
+        lrExit();
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "lr: init failed rc=%08X", rc_lr_init);
+        LOG_E(msg);
+    }
+
+    Result rc = 0;
+    for (int i = 0; i < 2; i++) {
+        NcmProgramLocation loc = {tid, storages_to_try[i], {0}};
+        rc = pmshellLaunchProgram(0, &loc, NULL);
+        {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "pmshellLaunchProgram: storage=%d rc=%08X (module=%d desc=%d)",
+                     storages_to_try[i], rc, R_MODULE(rc), R_DESCRIPTION(rc));
+            LOG_I(msg);
+        }
+        if (R_SUCCEEDED(rc)) return rc;
+    }
+    return rc;
+}
+
 void handle_client(int client_sock) {
     trace("handle_client: entered");
     char buffer[2048] = {0};
@@ -224,6 +280,42 @@ void handle_client(int client_sock) {
         close(client_sock);
         trace("handle_client: early return (no data)");
         return;
+    }
+
+    // curl (and most HTTP clients) routinely write the request headers and the POST
+    // body as two separate send() calls, which can land as two separate TCP segments.
+    // The single recv() above can return with just the headers and zero body bytes
+    // even though the client already sent both - leaving POST handlers below (eg.
+    // POST /command's launch_app) looking at an empty body and misreporting "Missing
+    // action" even though one was sent. Keep pulling more data in until we've seen the
+    // full Content-Length worth of body, or run out of buffer/time.
+    {
+        char* body_start = strstr(buffer, "\r\n\r\n");
+        if (body_start) {
+            char* cl_hdr = strstr(buffer, "Content-Length:");
+            if (!cl_hdr) cl_hdr = strstr(buffer, "content-length:");
+            if (cl_hdr) {
+                long content_length = strtol(cl_hdr + 15, NULL, 10);
+                long have_body = bytes_read - ((body_start + 4) - buffer);
+                {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "body-wait: initial bytes_read=%d have_body=%ld content_length=%ld",
+                             bytes_read, have_body, content_length);
+                    LOG_I(msg);
+                }
+                while (have_body < content_length && bytes_read < (int)(sizeof(buffer) - 1)) {
+                    int more = recv_timeout(client_sock, buffer + bytes_read, sizeof(buffer) - 1 - bytes_read, 2);
+                    {
+                        char msg[64];
+                        snprintf(msg, sizeof(msg), "body-wait: retry recv_timeout returned %d", more);
+                        LOG_I(msg);
+                    }
+                    if (more <= 0) break;
+                    bytes_read += more;
+                    have_body += more;
+                }
+            }
+        }
     }
 
     bool requires_auth = true;
@@ -317,30 +409,35 @@ void handle_client(int client_sock) {
 
         u64 title_id = 0;
         char title_name[512] = "None";
-        u64 titles[1];
-        s32 total_titles = 0;
-        AccountUid uid = {0};
-        if (R_SUCCEEDED(pdmqryQueryRecentlyPlayedApplication(uid, false, titles, 1, &total_titles)) && total_titles > 0) {
-            trace("info: pdmqry ok, has recent title");
-            title_id = titles[0];
-            NsApplicationControlData* controlData = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
-            if (controlData) {
-                u64 actual_size = 0;
-                trace("info: before nsGetApplicationControlData");
-                if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, title_id, controlData, sizeof(NsApplicationControlData), &actual_size))) {
-                    trace("info: after nsGetApplicationControlData ok");
-                    NacpLanguageEntry* langentry = NULL;
-                    if (R_SUCCEEDED(nacpGetLanguageEntry(&controlData->nacp, &langentry))) {
-                        strncpy(title_name, langentry->name, sizeof(title_name) - 1);
-                        title_name[sizeof(title_name) - 1] = '\0';
+        u64 app_pid = 0;
+        // pdmqryQueryRecentlyPlayedApplication() (used here previously) reports the last
+        // application recorded in the play-log database, not what's actually running -
+        // same class of bug as the ns ApplicationRecord/ncm mismatch fixed for /titles.
+        // pmdmnt is the same mechanism the home menu/other homebrew use to know what's
+        // running right now: it fails outright (no PID) when at the home menu, so a
+        // failure here correctly means "nothing running", not "let's report stale data".
+        if (R_SUCCEEDED(pmdmntGetApplicationProcessId(&app_pid))) {
+            trace("info: pmdmnt - application running");
+            if (R_SUCCEEDED(pmdmntGetProgramId(&title_id, app_pid))) {
+                NsApplicationControlData* controlData = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
+                if (controlData) {
+                    u64 actual_size = 0;
+                    trace("info: before nsGetApplicationControlData");
+                    if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, title_id, controlData, sizeof(NsApplicationControlData), &actual_size))) {
+                        trace("info: after nsGetApplicationControlData ok");
+                        NacpLanguageEntry* langentry = NULL;
+                        if (R_SUCCEEDED(nacpGetLanguageEntry(&controlData->nacp, &langentry))) {
+                            strncpy(title_name, langentry->name, sizeof(title_name) - 1);
+                            title_name[sizeof(title_name) - 1] = '\0';
+                        }
+                    } else {
+                        trace("info: nsGetApplicationControlData FAILED");
                     }
-                } else {
-                    trace("info: nsGetApplicationControlData FAILED");
+                    free(controlData);
                 }
-                free(controlData);
             }
         } else {
-            trace("info: pdmqry - no recent title or failed");
+            trace("info: pmdmnt - no application running (home menu)");
         }
         trace("info: after title block");
 
@@ -573,10 +670,17 @@ void handle_client(int client_sock) {
                 } else if (action == "launch_app" && j.contains("title_id")) {
                     std::string tid_str = j.value("title_id", "");
                     u64 tid = strtoull(tid_str.c_str(), NULL, 16);
-                    // Lazy applet session: see the note near appletInitialize in main().
-                    appletInitialize();
-                    rc = appletRequestLaunchApplication(tid, NULL);
-                    appletExit();
+                    // appletRequestLaunchApplication() (used here previously) asks am to
+                    // launch on behalf of the CALLING application applet session - same
+                    // class of bug as appletRequestToSleep() (see the note on POST
+                    // /sleep): this sysmodule has no such session (AppletType_None), so
+                    // it always failed with LibnxError_NotInitialized. pmshell is the
+                    // lower-level service qlaunch/hbmenu actually use to start a program
+                    // (already used identically by POST /launch below) and doesn't need
+                    // one.
+                    pmshellInitialize();
+                    rc = launch_program_by_id(tid);
+                    pmshellExit();
                 }
                 
                 std::string resp_body = "{\"status\": \"ok\", \"rc\": " + std::to_string(rc) + "}";
@@ -674,8 +778,7 @@ void handle_client(int client_sock) {
             snprintf(log_msg, sizeof(log_msg), "Launching title ID: 0x%016lX", (unsigned long)tid);
             LOG_I(log_msg);
             pmshellInitialize();
-            NcmProgramLocation loc = {tid, NcmStorageId_None, {0}};
-            if (R_FAILED(pmshellLaunchProgram(0, &loc, NULL))) {
+            if (R_FAILED(launch_program_by_id(tid))) {
                 snprintf(log_msg, sizeof(log_msg), "Failed to launch title ID: 0x%016lX", (unsigned long)tid);
                 LOG_E(log_msg);
             }
@@ -899,7 +1002,7 @@ int main(int, char **) {
     rc = psmInitialize(); log_boot_status("psm", rc);
     rc = tsInitialize(); log_boot_status("ts", rc);
     rc = nifmInitialize(NifmServiceType_User); log_boot_status("nifm", rc);
-    rc = pdmqryInitialize(); log_boot_status("pdmqry", rc);
+    rc = pmdmntInitialize(); log_boot_status("pmdmnt", rc);
     rc = nsInitialize(); log_boot_status("ns", rc);
     rc = ncmInitialize(); log_boot_status("ncm", rc);
     // NOT appletInitialize() here: it opens a client session with am/omm (the Operation
@@ -1068,12 +1171,16 @@ int main(int, char **) {
         }
     }
 
+    // Restarting core (after a redeploy, or after it stops responding) is the
+    // orchestrator's job now (switch_sysmodule_orchestrator/) - it terminates and
+    // relaunches this program from outside, which also covers the case this process
+    // can no longer handle itself: a broken deploy that can't even reach this code.
     if (g_capssc_ready) capsscExit();
     hiddbgExit();
     apmExit();
     ncmExit();
     nsExit();
-    pdmqryExit();
+    pmdmntExit();
     nifmExit();
     tsExit();
     setsysExit();
